@@ -52,10 +52,10 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- default (printf "%s-catalog" (include "databases-ui.fullname" .)) .Values.catalog.existingConfigMap }}
 {{- end }}
 
-{{- /* The catalog as YAML text: catalog.content is a map in values, or a string from --set-file. */}}
+{{- /* The catalog as YAML text: catalog.text as it is, else catalog.content. */}}
 {{- define "databases-ui.catalogContent" -}}
-{{- if kindIs "string" .Values.catalog.content }}
-{{- .Values.catalog.content }}
+{{- if .Values.catalog.text }}
+{{- .Values.catalog.text }}
 {{- else }}
 {{- toYaml .Values.catalog.content }}
 {{- end }}
@@ -70,8 +70,8 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- $_ := required "config.publicOrigin is required, such as https://databases.example.com" .Values.config.publicOrigin }}
 {{- $_ := required "azure.tenantId is required" .Values.azure.tenantId }}
 {{- $_ := required "azure.clientId is required" .Values.azure.clientId }}
-{{- if and (not .Values.catalog.existingConfigMap) (not .Values.catalog.content) }}
-{{- fail "set catalog.content (environments and teams) or catalog.existingConfigMap" }}
+{{- if not (or .Values.catalog.existingConfigMap .Values.catalog.content .Values.catalog.text) }}
+{{- fail "set catalog.content or catalog.text (the environments), or catalog.existingConfigMap" }}
 {{- end }}
 {{- if and (not .Values.azure.workloadIdentity.enabled) (not .Values.azure.clientSecret.existingSecret) }}
 {{- fail "set azure.workloadIdentity.enabled, or azure.clientSecret.existingSecret" }}
@@ -121,10 +121,20 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 - name: DATABASES_UI_STORAGE_SAS_SECRET
   value: {{ printf "%s/%s" .Values.storage.sas.existingSecret .Values.storage.sas.key | quote }}
 {{- end }}
-- name: DATABASES_UI_ADMIN_ROLE
-  value: {{ .Values.config.adminRole | quote }}
-- name: DATABASES_UI_AUDITOR_ROLE
-  value: {{ .Values.config.auditorRole | quote }}
+{{- with .Values.azure.storageClientId }}
+- name: DATABASES_UI_STORAGE_CLIENT_ID
+  value: {{ . | quote }}
+{{- end }}
+- name: DATABASES_UI_NAMESPACE_LABEL
+  value: {{ .Values.config.namespaceLabel | quote }}
+- name: DATABASES_UI_USERNAME_CLAIM
+  value: {{ .Values.config.kubernetesUser.claim | quote }}
+- name: DATABASES_UI_USERNAME_PREFIX
+  value: {{ .Values.config.kubernetesUser.prefix | quote }}
+- name: DATABASES_UI_GROUPS_CLAIM
+  value: {{ .Values.config.kubernetesGroups.claim | quote }}
+- name: DATABASES_UI_GROUPS_PREFIX
+  value: {{ .Values.config.kubernetesGroups.prefix | quote }}
 {{- range $key, $env := dict "accent" "ACCENT" "accentText" "ACCENT_TEXT" "accentDark" "ACCENT_DARK" "accentTextDark" "ACCENT_TEXT_DARK" }}
 {{- with index $.Values.branding $key }}
 - name: DATABASES_UI_BRAND_{{ $env }}

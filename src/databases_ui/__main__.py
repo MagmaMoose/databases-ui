@@ -29,7 +29,8 @@ def check(path: Path) -> int:
         for problem in err.problems:
             print(problem, file=sys.stderr)
         return 1
-    print(f"{len(catalog.environments)} environments, {len(catalog.teams)} teams, {len(catalog.grants)} databases granted: the catalog holds together.")
+    here = sorted(e.name for e in catalog.environments.values() if e.runs_jobs)
+    print(f"{len(catalog.environments)} environments, {', '.join(here)} in this cluster: the catalog holds together.")
     return 0
 
 
@@ -50,7 +51,11 @@ def serve() -> None:
                 "credential": "workload identity" if cfg.federated_token_file else "client secret",
                 "storage": "sas" if cfg.storage_sas else "entra",
                 "environments": sorted(cfg.catalog.environments),
-                "teams": len(cfg.catalog.teams),
+                "storage_client": cfg.storage_client_id,
+                "namespace_label": cfg.namespace_label,
+                # Who the access reviews ask about, as the API server derives it from a token.
+                "kubernetes_user": f"{cfg.username_prefix}<{cfg.username_claim}>",
+                "kubernetes_groups": f"{cfg.groups_prefix}<{cfg.groups_claim}>",
                 "job_image": cfg.job_image,
             }
         )

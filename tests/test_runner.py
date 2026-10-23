@@ -27,8 +27,14 @@ def tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     bin_dir.mkdir()
     scripts = {
         "pg_dump": '#!/bin/sh\nprintf PGDMP\nhead -c "${DUMP_BYTES:-100}" /dev/zero | tr "\\000" x\nif [ -n "$DUMP_FAIL" ]; then echo "pg_dump: error: $DUMP_FAIL" >&2; exit 1; fi\n',
-        "pg_restore": '#!/bin/sh\necho "$@" > "$OUT/restore-args"\ncat > "$OUT/restored"\nif [ -n "$RESTORE_FAIL" ]; then echo "pg_restore: error: $RESTORE_FAIL" >&2; exit 1; fi\n',
-        "psql": '#!/bin/sh\nfor last; do :; done\necho "$last" >> "$OUT/psql"\nif [ -n "$PSQL_FAIL" ]; then echo "psql: error: $PSQL_FAIL" >&2; exit 2; fi\necho 2\n',
+        # Its script is the archive itself, which is all psql needs to show here.
+        "pg_restore": '#!/bin/sh\necho "$@" > "$OUT/restore-args"\nif [ -n "$RESTORE_FAIL" ]; then head -c 3; echo "pg_restore: error: $RESTORE_FAIL" >&2; exit 1; fi\ncat\n',
+        "psql": (
+            '#!/bin/sh\nfor last; do :; done\n'
+            'if [ "$last" = "--file=-" ]; then echo "$@" > "$OUT/psql-args"; cat > "$OUT/script"; '
+            'if [ -n "$SCRIPT_FAIL" ]; then echo "psql:<stdin>:9: ERROR: $SCRIPT_FAIL" >&2; exit 3; fi; exit 0; fi\n'
+            'echo "$last" >> "$OUT/psql"\nif [ -n "$PSQL_FAIL" ]; then echo "psql: error: $PSQL_FAIL" >&2; exit 2; fi\necho 2\n'
+        ),
     }
     for name, body in scripts.items():
         (bin_dir / name).write_text(body)
@@ -49,6 +55,7 @@ def job_env(tmp_path: Path, action: str, **extra: str) -> dict[str, str]:
         "DBUI_JOB": f"dbui-{action}-12345678",
         "DBUI_ENVIRONMENT": "dev",
         "DBUI_DATABASE": "payments_dev",
+        "DBUI_NAMESPACE": "dev-payments",
         "DBUI_REQUESTED_BY": "alice@example.com",
         "DBUI_BLOB_URL": f"{STORAGE}/dev",
         "DBUI_BLOB": SNAPSHOT,
@@ -103,24 +110,43 @@ def test_restore_in_place_scales_the_workloads_down_and_back(world, tools, tmp_p
     env = job_env(tmp_path, "restore", DBUI_SCALE=json.dumps([["deployment", "dev-payments", "api"], ["statefulset", "dev-payments", "gone"]]))
     code, outcome = run(world, env)
     assert code == 0 and outcome == {"result": "succeeded", "bytes": 3_000_005, "seconds": outcome["seconds"]}
-    assert (tools / "restored").read_bytes() == b"PGDMP" + b"y" * 3_000_000
-    assert (tools / "restore-args").read_text().split() == ["--format=custom", "--clean", "--if-exists", "--no-owner", "--no-acl", "--single-transaction", "--no-password", "--dbname=payments_dev"]
+    # One transaction: what the owner owns goes, the snapshot's script runs, then COMMIT.
+    assert (tools / "script").read_bytes() == b"BEGIN;\nDROP OWNED BY CURRENT_USER;\nPGDMP" + b"y" * 3_000_000 + b"\nCOMMIT;\n"
+    assert (tools / "restore-args").read_text().split() == ["--format=custom", "--clean", "--if-exists", "--no-owner", "--no-acl", "--file=-"]
+    assert (tools / "psql-args").read_text().split() == ["--no-password", "--no-psqlrc", "--quiet", "-v", "ON_ERROR_STOP=1", "--dbname=payments_dev", "--file=-"]
     assert "pg_terminate_backend" in (tools / "psql").read_text()
-    patches = [json.loads(json.dumps(c)) for c in world.kube.calls if c[0] == "PATCH"]
-    assert patches == [["PATCH", f"{APPS}/api"], ["PATCH", f"{APPS}/api"]]
+    patches = [c for c in world.kube.calls if c[0] == "PATCH"]
+    assert patches == [("PATCH", f"{APPS}/api"), ("PATCH", f"{APPS}/api")]
     api = world.kube.get(APPS, "api")
     assert api["spec"]["replicas"] == 3 and "databases-ui/replicas-before-restore" not in (api["metadata"].get("annotations") or {})
-    assert world.storage.audit("dev")[0]["action"] == "restore.succeeded"
+    assert world.storage.audit("dev")[0]["action"] == "restore.succeeded" and world.storage.audit("dev")[0]["namespace"] == "dev-payments"
 
 
-def test_a_failed_restore_still_scales_back(world, tools, tmp_path, monkeypatch):
-    monkeypatch.setenv("RESTORE_FAIL", "must be owner of table orders")
+def test_a_failed_pg_restore_never_commits_and_still_scales_back(world, tools, tmp_path, monkeypatch):
+    monkeypatch.setenv("RESTORE_FAIL", "unsupported version (1.16) in file header")
     world.snapshot("dev", "payments_dev", "20261023T140000Z-abcdef")
     # An earlier restore died before scaling back: the annotation has the real count.
     world.kube.put(APPS, {"metadata": {"name": "api", "annotations": {"databases-ui/replicas-before-restore": "4"}}, "spec": {"replicas": 0, "selector": {"matchLabels": {"app": "api"}}}})
     code, outcome = run(world, job_env(tmp_path, "restore", DBUI_SCALE=json.dumps([["deployment", "dev-payments", "api"]])))
-    assert code == 1 and "nothing changed" in outcome["reason"] and "must be owner of table orders" in outcome["reason"]
+    assert code == 1 and "pg_restore exited 1, nothing changed" in outcome["reason"] and "unsupported version" in outcome["reason"]
+    assert b"COMMIT" not in (tools / "script").read_bytes()
     assert world.kube.get(APPS, "api")["spec"]["replicas"] == 4
+
+
+def test_a_failed_statement_rolls_the_restore_back(world, tools, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCRIPT_FAIL", 'type "citext" does not exist')
+    world.snapshot("dev", "payments_dev", "20261023T140000Z-abcdef")
+    code, outcome = run(world, job_env(tmp_path, "restore"))
+    assert code == 1 and outcome["reason"].startswith("the restore failed, nothing changed") and "citext" in outcome["reason"]
+
+
+def test_a_download_that_breaks_off_commits_nothing(world, tools, tmp_path):
+    world.snapshot("dev", "payments_dev", "20261023T140000Z-abcdef", data=b"PGDMP" + b"z" * 100_000)
+    world.storage.break_after = 50_000
+    code, outcome = run(world, job_env(tmp_path, "restore"))
+    assert code == 1 and "broke off" in outcome["reason"]
+    # psql was stopped, maybe before it read a byte: either way it never saw COMMIT.
+    assert not (tools / "script").exists() or b"COMMIT" not in (tools / "script").read_bytes()
 
 
 def test_restore_waits_for_pods_to_go_and_gives_up(world, tools, tmp_path):
@@ -136,7 +162,7 @@ def test_restore_into_a_copy_waits_for_the_database(world, tools, tmp_path, monk
     world.snapshot("dev", "payments_dev", "20261023T140000Z-abcdef")
     code, _ = run(world, job_env(tmp_path, "restore", DBUI_WAIT_FOR_DATABASE="1", PGDATABASE="payments_dev_copy"))
     assert code == 0 and (tools / "psql").read_text().splitlines()[0] == "select 1"
-    assert (tools / "restore-args").read_text().split()[-1] == "--dbname=payments_dev_copy"
+    assert "--dbname=payments_dev_copy" in (tools / "psql-args").read_text().split()
     monkeypatch.setenv("PSQL_FAIL", "database does not exist")
     code, outcome = run(world, job_env(tmp_path, "restore", DBUI_WAIT_FOR_DATABASE="1", PGDATABASE="payments_dev_copy"))
     assert code == 1 and "never became reachable" in outcome["reason"]

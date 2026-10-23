@@ -38,40 +38,51 @@ STORAGE = "https://snapshots.blob.example.test"
 KUBE = "https://kubernetes.example.test"
 NOW = datetime(2026, 10, 23, 14, 0, 0, tzinfo=UTC)
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-PAYMENTS = "6f1c2b7e-3a44-4d0e-9a51-2b8e0c7d9f10"
-IDENTITY = "0b9d8e7c-6f5a-4b3c-8d2e-1f0a9b8c7d6e"
-UNRELATED = "99999999-9999-4999-8999-999999999999"
-
 CATALOG = f"""
 environments:
   - name: dev
     storage:
       url: {STORAGE}/dev
-    cloneFrom: [acc, prd]
+    cloneFrom: [acc]
   - name: acc
     kubernetes: none
     storage:
       url: {STORAGE}/acc
+  - name: tst
+    kubernetes: none
+    storage:
+      url: {STORAGE}/tst
+    cloneFrom: [dev]
   - name: prd
     production: true
     cluster: prod
     storage:
       url: {STORAGE}/prd
-teams:
-  - id: payments
-    name: Payments
-    groups: [{PAYMENTS}]
-    databases:
-      - name: payments_{{env}}
-        workloads:
-          - deployment/{{env}}-payments/api
-  - id: identity
-    name: Identity
-    groups: [{IDENTITY}]
-    databases:
-      - name: keycloak
-        environments: [dev]
 """
+
+# What each Kubernetes tier lets someone do in a namespace, as the API server's RBAC would answer.
+VIEW = {("list", "", "pods")}
+EDIT = VIEW | {("get", "", "secrets")}
+ADMIN = EDIT | {("create", "rbac.authorization.k8s.io", "rolebindings")}
+# Groups (as in the ID token) and the namespaces they hold tiers in; "*" is every namespace.
+RBAC = {
+    "k8s-dev-payments-read": {"dev-payments": VIEW},
+    "k8s-dev-payments-write": {"dev-payments": EDIT},
+    "k8s-prd-payments-write": {"prd-payments": EDIT},
+    "k8s-prd-payments-admin": {"prd-payments": ADMIN},
+    "k8s-dev-identity-write": {"dev-identity": EDIT},
+    "cloud-read": {"*": VIEW},
+    "cloud-admin": {"*": ADMIN},
+}
+PEOPLE = {
+    "alice@example.com": ["k8s-dev-payments-write", "k8s-prd-payments-admin"],
+    "bob@example.com": ["k8s-dev-payments-write", "k8s-prd-payments-admin"],
+    "pat@example.com": ["k8s-prd-payments-write"],
+    "carol@example.com": ["k8s-dev-identity-write"],
+    "vera@example.com": ["k8s-dev-payments-read"],
+    "audrey@example.com": ["cloud-read"],
+    "root@example.com": ["cloud-admin"],
+}
 
 
 def oid(upn: str) -> str:
@@ -81,9 +92,10 @@ def oid(upn: str) -> str:
 @dataclass
 class FakeEntra:
     user: str = "alice@example.com"
-    roles: list[str] = field(default_factory=list)
     groups: list[str] = field(default_factory=list)
     overage: bool = False
+    # More claims in the next ID token.
+    extra: dict[str, Any] = field(default_factory=dict)
     tenant: str = TENANT
     challenge: str = ""
     nonce: str = ""
@@ -106,8 +118,8 @@ class FakeEntra:
             "oid": oid(self.user),
             "name": self.user.split("@")[0].title(),
             "preferred_username": self.user,
-            "roles": self.roles,
             "groups": self.groups,
+            **self.extra,
         }
         if self.overage:
             claims.pop("groups")
@@ -137,6 +149,15 @@ class StoredBlob:
     kind: str = "BlockBlob"
 
 
+class Broken(httpx.AsyncByteStream):
+    def __init__(self, head: bytes):
+        self.head = head
+
+    async def __aiter__(self):
+        yield self.head
+        raise httpx.ReadError("connection reset")
+
+
 @dataclass
 class FakeStorage:
     blobs: dict[str, StoredBlob] = field(default_factory=dict)
@@ -145,6 +166,8 @@ class FakeStorage:
     # Answers to fail with, by (method, comp): a status code each time.
     fail: dict[tuple[str, str], int] = field(default_factory=dict)
     page: int = 1000
+    # Downloads break off after this many bytes, as a dropped connection would.
+    break_after: int | None = None
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         if request.headers.get("authorization") != "Bearer storage-token" and "sig" not in request.url.params:
@@ -177,6 +200,11 @@ class FakeStorage:
             meta = {k[len("x-ms-meta-") :]: v for k, v in request.headers.items() if k.startswith("x-ms-meta-")}
             self.blobs[key] = StoredBlob(b"".join(self.blocks.pop((key, i)) for i in ids), meta, formatdate(usegmt=True))
             return httpx.Response(201)
+        if request.method == "PUT" and comp == "metadata":
+            if key not in self.blobs:
+                return httpx.Response(404, headers={"x-ms-error-code": "BlobNotFound"})
+            self.blobs[key].metadata = {k[len("x-ms-meta-") :]: v for k, v in request.headers.items() if k.startswith("x-ms-meta-")}
+            return httpx.Response(200)
         if request.method == "PUT" and comp == "appendblock":
             if key not in self.blobs:
                 return httpx.Response(404, headers={"x-ms-error-code": "BlobNotFound"})
@@ -192,6 +220,8 @@ class FakeStorage:
             if blob is None:
                 return httpx.Response(404, headers={"x-ms-error-code": "BlobNotFound"})
             headers = {"content-length": str(len(blob.data)), "x-ms-creation-time": blob.created, **{f"x-ms-meta-{k}": v for k, v in blob.metadata.items()}}
+            if request.method == "GET" and self.break_after is not None:
+                return httpx.Response(200, headers=headers, stream=Broken(blob.data[: self.break_after]))
             return httpx.Response(200, headers=headers, content=blob.data if request.method == "GET" else b"")
         return httpx.Response(400, headers={"x-ms-error-code": "Unhandled"})
 
@@ -229,6 +259,15 @@ class FakeKube:
     calls: list[tuple[str, str]] = field(default_factory=list)
     # Answer every call with this status, as an API server that refuses this app would.
     refuse: int = 0
+    reviews: list[dict[str, Any]] = field(default_factory=list)
+
+    def review(self, spec: dict[str, Any]) -> bool:
+        self.reviews.append(spec)
+        attrs = spec["resourceAttributes"]
+        want = (attrs["verb"], attrs.get("group", ""), attrs["resource"])
+        groups = [g.removeprefix("oidc:") for g in spec.get("groups", [])]
+        assert "system:authenticated" in groups and spec["user"].startswith("oidc:")
+        return any(want in tiers.get(attrs["namespace"], set()) | tiers.get("*", set()) for g in groups for tiers in [RBAC.get(g, {})])
 
     def put(self, collection: str, obj: dict[str, Any]) -> dict[str, Any]:
         obj.setdefault("metadata", {}).setdefault("labels", {})
@@ -253,6 +292,9 @@ class FakeKube:
         if request.method == "GET":
             found = items.get(name)
             return httpx.Response(200, json=copy.deepcopy(found)) if found else httpx.Response(404, json={"message": f"{name} not found"})
+        if request.method == "POST" and path == "/apis/authorization.k8s.io/v1/subjectaccessreviews":
+            body = json.loads(request.content)
+            return httpx.Response(201, json={**body, "status": {"allowed": self.review(body["spec"])}})
         if request.method == "POST":
             body = json.loads(request.content)
             if body["metadata"]["name"] in items:
@@ -276,8 +318,11 @@ JOBS = "/apis/batch/v1/namespaces/database/jobs"
 PODS = "/api/v1/namespaces/database/pods"
 
 
-def database(name: str, owner: str, cluster: str, **spec: Any) -> dict[str, Any]:
-    return {"metadata": {"name": name.replace("_", "-"), "labels": {}}, "spec": {"name": name, "owner": owner, "cluster": {"name": cluster}, **spec}, "status": {"applied": True}}
+def database(name: str, owner: str, cluster: str, namespace: str = "", workloads: str = "", **spec: Any) -> dict[str, Any]:
+    meta: dict[str, Any] = {"name": name.replace("_", "-"), "labels": {"databases-ui/namespace": namespace} if namespace else {}}
+    if workloads:
+        meta["annotations"] = {"databases-ui/workloads": workloads}
+    return {"metadata": meta, "spec": {"name": name, "owner": owner, "cluster": {"name": cluster}, **spec}, "status": {"applied": True}}
 
 
 @dataclass
@@ -297,17 +342,21 @@ class World:
         return httpx.Response(404, json={"error": "unhandled", "url": url})
 
     def seed(self) -> None:
-        for name, cluster, roles in (("dev", "dev", ["payments_dev", "keycloak"]), ("prod", "prod", ["payments_prd"])):
+        for name, roles in (("dev", ["payments_dev", "keycloak"]), ("prod", ["payments_prd"])):
             self.kube.put(
                 f"{CNPG}/clusters",
-                {"metadata": {"name": name}, "spec": {"managed": {"roles": [{"name": r, "passwordSecret": {"name": f"{r}-db"}} for r in roles] + [{"name": "nopass"}]}}, "status": {"certificates": {"serverCASecret": f"{cluster}-ca"}}},
+                {
+                    "metadata": {"name": name},
+                    "spec": {"managed": {"roles": [{"name": r, "login": True, "passwordSecret": {"name": f"{r}-db"}} for r in roles] + [{"name": "nopass"}]}},
+                    "status": {"certificates": {"serverCASecret": f"{name}-ca"}},
+                },
             )
         for d in (
-            database("payments_dev", "payments_dev", "dev", extensions=[{"name": "citext", "ensure": "present"}, {"name": "old", "ensure": "absent"}]),
-            database("keycloak", "keycloak", "dev"),
+            database("payments_dev", "payments_dev", "dev", "dev-payments", "deployment/api, statefulset/worker", extensions=[{"name": "citext", "ensure": "present"}, {"name": "old", "ensure": "absent"}]),
+            database("keycloak", "keycloak", "dev", "dev-identity"),
             database("platform_only", "nopass", "dev"),
-            database("payments_prd", "payments_prd", "prod"),
-            database("gone", "payments_dev", "dev", ensure="absent"),
+            database("payments_prd", "payments_prd", "prod", "prd-payments", "deployment/api"),
+            database("gone", "payments_dev", "dev", "dev-payments", ensure="absent"),
         ):
             self.kube.put(f"{CNPG}/databases", d)
 
@@ -351,9 +400,9 @@ def client(world: World, env: dict[str, str]) -> TestClient:
     return make_client(world, env)
 
 
-def sign_in(client: TestClient, world: World, upn: str = "alice@example.com", groups: list[str] | tuple[str, ...] = (PAYMENTS,), roles: list[str] | tuple[str, ...] = ()) -> dict[str, Any]:
+def sign_in(client: TestClient, world: World, upn: str = "alice@example.com", groups: list[str] | None = None) -> dict[str, Any]:
     client.cookies.clear()
-    world.entra.user, world.entra.groups, world.entra.roles = upn, list(groups), list(roles)
+    world.entra.user, world.entra.groups = upn, PEOPLE.get(upn, []) if groups is None else groups
     response = client.get("/auth/login")
     query = parse_qs(urlsplit(response.headers["location"]).query)
     world.entra.challenge, world.entra.nonce = query["code_challenge"][0], query["nonce"][0]

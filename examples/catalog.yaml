@@ -1,44 +1,26 @@
-# Four environments, each with its own cluster and storage, and two teams. Check it with
+# The catalog of the instance in the dev cluster. Every instance lists every environment; only the
+# one in its own cluster runs Jobs, the others are where shared snapshots come from or go to.
+# Check it with
 #   python -m databases_ui check examples/catalog.yaml
 environments:
   - name: dev
     storage:
       url: https://examplesnapshots.blob.core.windows.net/dev
+    # Snapshots tst and acc share with a namespace here can be cloned into it.
     cloneFrom: [tst, acc]
   - name: tst
+    kubernetes: none
     storage:
       url: https://examplesnapshots.blob.core.windows.net/tst
     cloneFrom: [acc]
   - name: acc
+    kubernetes: none
     storage:
       url: https://examplesnapshots.blob.core.windows.net/acc
   - name: prd
+    kubernetes: none
     production: true
     # The Cluster's own name, when it differs from the environment's.
     cluster: prod
     storage:
       url: https://exampleprdsnapshots.blob.core.windows.net/prd
-
-teams:
-  - id: payments
-    name: Payments
-    description: Builds and runs the payments service.
-    groups: [6f1c2b7e-3a44-4d0e-9a51-2b8e0c7d9f10]
-    databases:
-      - name: payments_{env}
-        # {env} is the environment; a block list, since YAML reads braces in [ ] as a mapping.
-        workloads:
-          - deployment/{env}-payments/payments-api
-          - deployment/{env}-payments/payments-worker
-  - id: identity
-    name: Identity
-    description: Runs single sign-on for every app.
-    groups: [0b9d8e7c-6f5a-4b3c-8d2e-1f0a9b8c7d6e]
-    databases:
-      - name: keycloak
-        environments: [dev, tst, acc]
-        workloads:
-          - statefulset/{env}-keycloak/keycloak
-      - name: keycloak_prd
-        environments: [prd]
-        workloads: [statefulset/prd-keycloak/keycloak]

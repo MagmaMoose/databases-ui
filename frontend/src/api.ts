@@ -2,7 +2,7 @@
 // the session's CSRF token. Who may see and do what is decided by the server; these types only
 // say what comes back.
 
-export type Environment = { name: string; production: boolean; runs_jobs: boolean; clone_from: string[]; downloads: boolean };
+export type Environment = { name: string; production: boolean; runs_jobs: boolean; clone_from: string[]; shares_to: string[]; downloads: boolean };
 
 export type Me = {
   name: string;
@@ -11,24 +11,37 @@ export type Me = {
   expires: number;
   version: string;
   release_notes: string | null;
-  admin: boolean;
-  auditor: boolean;
-  teams: { id: string; name: string }[];
+  // Who Kubernetes takes this person for, which decides what they see here.
+  kubernetes: { user: string; groups: string[] };
   environments: Environment[];
 };
 
 export type Database = {
   name: string;
+  namespace: string;
   owner: string;
-  ready: boolean | null;
+  owner_secret: string;
+  ready: boolean;
   message: string;
-  teams: string[];
   workloads: string[];
   copy: { name: string; ready: boolean } | null;
-  can_act: boolean;
+  can_snapshot: boolean;
+  can_restore: boolean;
 };
 
-export type Snapshot = { id: string; created: string; size: number; created_by: string; note: string; sha256: string };
+export type User = { name: string; managed: boolean; login: boolean; secret: string; databases: string[]; namespaces: string[] };
+
+export type Snapshot = {
+  environment: string;
+  database: string;
+  id: string;
+  created: string;
+  size: number;
+  created_by: string;
+  note: string;
+  namespace: string;
+  shared_with: string[];
+};
 
 export type JobState = "waiting" | "starting" | "running" | "succeeded" | "failed" | "expired";
 
@@ -36,6 +49,7 @@ export type Job = {
   name: string;
   action: "snapshot" | "restore";
   database: string;
+  namespace: string;
   state: JobState;
   requested_by: string;
   requested_at: string;
@@ -56,7 +70,7 @@ export type Job = {
   can_decline: boolean;
 };
 
-export type AuditEntry = { at: string; environment: string; actor: string; action: string; database?: string; job?: string; snapshot?: string; target?: string; detail?: string };
+export type AuditEntry = { at: string; environment: string; actor: string; action: string; database?: string; namespace?: string; job?: string; snapshot?: string; target?: string; detail?: string };
 
 export type RestoreRequest = { source_environment: string; source_database: string; snapshot: string; into: "database" | "copy"; reason: string };
 
@@ -73,7 +87,7 @@ export class ApiError extends Error {
 const MESSAGES: Record<string, string> = {
   signed_out: "Your session has ended. Sign in again.",
   csrf: "This page is out of date. Reload it and try again.",
-  not_allowed: "You may not do that with this database.",
+  not_allowed: "Kubernetes does not let you do that in this database's namespace.",
   invalid_request: "Some fields are not valid.",
 };
 
@@ -114,6 +128,10 @@ export const api = {
   snapshots: (e: string, d: string) => request<{ snapshots: Snapshot[] }>("GET", `${db(e, d)}/snapshots`).then((r) => r.snapshots),
   snapshot: (e: string, d: string, note: string) => request<Job>("POST", `${db(e, d)}/snapshots`, { note }),
   restore: (e: string, d: string, body: RestoreRequest) => request<Job>("POST", `${db(e, d)}/restore`, body),
+  shared: (e: string, d: string) => request<{ snapshots: Snapshot[] }>("GET", `${db(e, d)}/shared`).then((r) => r.snapshots),
+  share: (e: string, d: string, id: string, target: { environment: string; namespace: string }) =>
+    request<Snapshot>("POST", `${db(e, d)}/snapshots/${encodeURIComponent(id)}/share`, target),
+  users: (e: string) => request<{ users: User[] }>("GET", `${env(e)}/users`).then((r) => r.users),
   dropCopy: (e: string, d: string) => request<unknown>("DELETE", `${db(e, d)}/copy`),
   downloadUrl: (e: string, d: string, id: string) => `${db(e, d)}/snapshots/${encodeURIComponent(id)}/download`,
   jobs: (e: string) => request<{ jobs: Job[] }>("GET", `${env(e)}/jobs`).then((r) => r.jobs),

@@ -8,7 +8,8 @@ from databases_ui.config import ConfigError, load_config
 def test_a_complete_environment_loads(env):
     cfg = load_config(env)
     assert cfg.redirect_uri == "https://databases.example.test/auth/callback" and cfg.secure_cookies
-    assert sorted(cfg.catalog.environments) == ["acc", "dev", "prd"] and cfg.job_service_account == "databases-ui-job"
+    assert sorted(cfg.catalog.environments) == ["acc", "dev", "prd", "tst"] and cfg.job_service_account == "databases-ui-job"
+    assert (cfg.username_claim, cfg.username_prefix, cfg.groups_claim, cfg.groups_prefix) == ("preferred_username", "oidc:", "groups", "oidc:")
     assert cfg.storage_sas == "" and cfg.static_dir is None and cfg.session_seconds == 8 * 3600
 
 
@@ -29,7 +30,10 @@ def test_a_complete_environment_loads(env):
         ({"DATABASES_UI_STORAGE_SAS": "sv=2022-11-02", "DATABASES_UI_STORAGE_SAS_SECRET": "sas/token"}, "a SAS token"),
         ({"DATABASES_UI_STORAGE_SAS": "sv=2022-11-02&sig=x", "DATABASES_UI_STORAGE_SAS_SECRET": "no-key"}, "<secret name>/<key>"),
         ({"AZURE_FEDERATED_TOKEN_FILE": "", "AZURE_CLIENT_SECRET": "s"}, "the Jobs reach storage through workload identity"),
-        ({"DATABASES_UI_ADMIN_ROLE": "has spaces"}, "DATABASES_UI_ADMIN_ROLE must be an app role value"),
+        ({"DATABASES_UI_STORAGE_CLIENT_ID": "not-a-guid"}, "DATABASES_UI_STORAGE_CLIENT_ID must be a GUID"),
+        ({"DATABASES_UI_NAMESPACE_LABEL": "not a label"}, "DATABASES_UI_NAMESPACE_LABEL must be a label key"),
+        ({"DATABASES_UI_USERNAME_CLAIM": "has spaces"}, "DATABASES_UI_USERNAME_CLAIM must be a claim name"),
+        ({"DATABASES_UI_GROUPS_PREFIX": "no spaces"}, "DATABASES_UI_GROUPS_PREFIX must be a prefix"),
         ({"DATABASES_UI_SESSION_HOURS": "48"}, "between 1 and 24"),
         ({"PORT": "eighty"}, "whole numbers"),
         ({"DATABASES_UI_BRAND_ACCENT": "teal"}, "#rrggbb"),
@@ -63,6 +67,12 @@ def test_secrets_from_files_and_a_sas_with_a_client_secret(env, tmp_path):
     assert cfg.branding.accent == "#0b6e4f"
     with pytest.raises(ConfigError, match="cannot read DATABASES_UI_SESSION_KEY_FILE"):
         load_config({**env, "DATABASES_UI_SESSION_KEY": "", "DATABASES_UI_SESSION_KEY_FILE": str(tmp_path / "missing")})
+
+
+def test_a_storage_identity_and_a_label_of_your_own(env):
+    cfg = load_config({**env, "DATABASES_UI_STORAGE_CLIENT_ID": "CCCCCCCC-bbbb-cccc-dddd-eeeeeeeeeeee", "DATABASES_UI_NAMESPACE_LABEL": "example.com/app-namespace"})
+    assert cfg.storage_client_id == "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee" and cfg.namespace_label == "example.com/app-namespace"
+    assert load_config(env).storage_client_id == cfg.client_id
 
 
 def test_plain_http_only_on_loopback(env):

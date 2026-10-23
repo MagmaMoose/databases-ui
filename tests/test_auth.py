@@ -2,15 +2,7 @@ from __future__ import annotations
 
 from urllib.parse import parse_qs, urlsplit
 
-from conftest import (
-    CLIENT,
-    IDENTITY,
-    PAYMENTS,
-    UNRELATED,
-    make_client,
-    sign_in,
-    write_headers,
-)
+from conftest import CLIENT, make_client, sign_in, write_headers
 
 from databases_ui.app import favicon_svg, release_notes, theme_css
 from databases_ui.config import Branding
@@ -21,13 +13,29 @@ def test_signed_out_until_signed_in(client):
     assert client.get("/api/environments/dev/databases").status_code == 401
 
 
-def test_sign_in_keeps_only_the_catalogs_groups(client, world):
-    me = sign_in(client, world, groups=[PAYMENTS, IDENTITY, UNRELATED], roles=["Admin"])
-    assert [t["id"] for t in me["teams"]] == ["payments", "identity"] and me["admin"] and not me["auditor"]
+def test_sign_in_names_the_person_as_the_api_server_does(client, world):
+    me = sign_in(client, world, "Alice.Smith@Example.com", groups=["k8s-dev-payments-write", "k8s-prd-payments-admin"])
+    # The claim as it is, prefixed: no lowercasing, or RBAC would know someone else.
+    assert me["kubernetes"] == {"user": "oidc:Alice.Smith@Example.com", "groups": ["oidc:k8s-dev-payments-write", "oidc:k8s-prd-payments-admin"]}
     login = world.entra.token_requests[-1]
     assert login["grant_type"] == ["authorization_code"] and login["client_assertion"] == ["federated-token"] and login["client_id"] == [CLIENT]
+    assert login["scope"] == ["openid profile"]
     cookie = next(c for c in client.cookies.jar if c.name.startswith("__Host-databases-ui"))
     assert cookie.secure and cookie.path == "/"
+
+
+def test_the_claims_and_prefixes_follow_the_cluster(world, env):
+    client = make_client(world, {**env, "DATABASES_UI_GROUPS_CLAIM": "roles", "DATABASES_UI_GROUPS_PREFIX": "", "DATABASES_UI_USERNAME_PREFIX": "entra#"})
+    world.entra.extra = {"roles": ["k8s-dev-payments-read"]}
+    assert sign_in(client, world, groups=[])["kubernetes"] == {"user": "entra#alice@example.com", "groups": ["k8s-dev-payments-read"]}
+
+
+def test_a_token_without_the_username_claim_is_refused(world, env):
+    client = make_client(world, {**env, "DATABASES_UI_USERNAME_CLAIM": "upn"})
+    response = client.get("/auth/login")
+    query = parse_qs(urlsplit(response.headers["location"]).query)
+    world.entra.challenge, world.entra.nonce = query["code_challenge"][0], query["nonce"][0]
+    assert "has+no+upn" in client.get(f"/auth/callback?code=good-code&state={query['state'][0]}").headers["location"]
 
 
 def test_a_sign_in_with_too_many_groups_is_refused(client, world):
@@ -36,7 +44,7 @@ def test_a_sign_in_with_too_many_groups_is_refused(client, world):
     query = parse_qs(urlsplit(response.headers["location"]).query)
     world.entra.challenge, world.entra.nonce = query["code_challenge"][0], query["nonce"][0]
     done = client.get(f"/auth/callback?code=good-code&state={query['state'][0]}")
-    assert "auth_error=" in done.headers["location"] and "groups+do+not+fit" in done.headers["location"]
+    assert "auth_error=" in done.headers["location"] and "do+not+fit+in+the+ID+token" in done.headers["location"]
 
 
 def test_another_tenant_a_bad_state_and_a_refusal(client, world):

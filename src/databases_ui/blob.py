@@ -106,6 +106,10 @@ class Container:
         meta = {k[len("x-ms-meta-") :].lower(): unquote(v) for k, v in response.headers.items() if k.lower().startswith("x-ms-meta-")}
         return Blob(name=name, size=int(response.headers.get("content-length", "0")), created=response.headers.get("x-ms-creation-time", ""), metadata=meta)
 
+    async def set_metadata(self, name: str, metadata: dict[str, str]) -> None:
+        """Replace a blob's metadata, all of it."""
+        await self._send("PUT", name, query={"comp": "metadata"}, headers={f"x-ms-meta-{k}": quote(v, safe="") for k, v in metadata.items()})
+
     async def upload(self, name: str, chunks: AsyncIterator[bytes], metadata: dict[str, str], before_commit: Callable[[], Awaitable[None]] | None = None) -> tuple[int, str]:
         """Write `chunks` to a block blob, committed with `metadata` once all are in and
         `before_commit` has not raised: its size and sha256."""

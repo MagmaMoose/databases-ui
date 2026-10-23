@@ -16,10 +16,13 @@ nameOverride: ""
 fullnameOverride: ""
 
 azure:
-  # The Entra ID tenant (a GUID) and the app registration's client id. One app signs people in
-  # and, with workload identity, reaches storage for the server and the Jobs.
+  # The Entra ID tenant (a GUID) and the client id of the app registration people sign in to: the
+  # one the cluster's API server trusts, so the ID token names them as Kubernetes does.
   tenantId: ""
   clientId: ""
+  # The identity that reaches storage, for the server and the Jobs. Empty: the sign-in app. A
+  # managed identity or app of its own needs federated credentials for the same service accounts.
+  storageClientId: ""
   # Leave empty for the public cloud (https://login.microsoftonline.com).
   authorityHost: ""
   # The app authenticates with its own service-account token, which Entra ID accepts through a
@@ -41,17 +44,26 @@ config:
   publicOrigin: ""
   # How long a sign-in lasts, 1 to 24.
   sessionHours: 8
-  # The app roles that act on every database (Admin) or read everything (Auditor).
-  adminRole: Admin
-  auditorRole: Auditor
+  # The label on a Database resource that names the namespace of the app it belongs to. Who may do
+  # what with it is Kubernetes RBAC in that namespace; without the label, in the Cluster's own.
+  namespaceLabel: databases-ui/namespace
+  # How the cluster's API server names people from their ID token, as in its authentication
+  # configuration: the access reviews ask about the same user and groups, so these must match.
+  kubernetesUser:
+    claim: preferred_username
+    prefix: "oidc:"
+  kubernetesGroups:
+    claim: groups
+    prefix: "oidc:"
 
-# The environments and the teams (see the README). Rendered into a ConfigMap from `content`, a
-# map here or the file's text with --set-file catalog.content=catalog.yaml, or read from your own
-# ConfigMap in the release namespace.
+# The environments (see the README). Rendered into a ConfigMap from `content`, a map here, or from
+# `text`, the file as it is (--set-file catalog.text=catalog.yaml); or read from your own ConfigMap
+# in the release namespace.
 catalog:
   existingConfigMap: ""
   key: catalog.yaml
-  content: ""
+  content: {}
+  text: ""
 
 # Where the Jobs run: the namespace of every in-cluster environment in the catalog, usually the
 # one that holds the CloudNativePG Clusters. Each gets a Role for this app, the Jobs' service

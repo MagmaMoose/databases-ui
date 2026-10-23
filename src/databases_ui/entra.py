@@ -2,8 +2,9 @@
 app's own token for Azure Storage.
 
 The credential is a workload identity token (AZURE_FEDERATED_TOKEN_FILE, which Entra trusts
-through a federated credential on the app registration) or a client secret. The sign-in asks
-only who the person is: their app roles (Admin, Auditor) and their groups come in the ID token.
+through a federated credential on the app registration) or a client secret. People sign in to the
+app registration the cluster's API server trusts, so their ID token names them the way Kubernetes
+does: the user and groups claims, with the API server's prefixes, are what access reviews ask about.
 """
 
 from __future__ import annotations
@@ -89,19 +90,23 @@ class Entra(OIDC):
         return app_credential(self._cfg)
 
     def _check_claims(self, claims: dict[str, Any]) -> None:
-        if str(claims.get("tid", "")).lower() != self._cfg.tenant_id or not claims.get("oid"):
+        cfg = self._cfg
+        if str(claims.get("tid", "")).lower() != cfg.tenant_id or not claims.get("oid"):
             raise SignInError("that account belongs to another tenant", status=401)
+        if not isinstance(claims.get(cfg.username_claim), str) or not claims[cfg.username_claim]:
+            raise SignInError(f"the ID token has no {cfg.username_claim}, which is how Kubernetes names you", status=401)
         # Over 200 groups, Entra leaves them out and points at Graph instead.
-        if "groups" in (claims.get("_claim_names") or {}) or claims.get("hasgroups"):
-            raise SignInError("your groups do not fit in the ID token; the app registration should emit only the groups assigned to the application", status=401)
+        if cfg.groups_claim in (claims.get("_claim_names") or {}):
+            raise SignInError(f"your {cfg.groups_claim} do not fit in the ID token, so Kubernetes would not know them either", status=401)
 
     async def _sign_in(self, body: dict[str, Any], claims: dict[str, Any]) -> SignIn:
-        named = self._cfg.catalog.groups
+        cfg = self._cfg
+        found = claims.get(cfg.groups_claim) or []
         return SignIn(
             oid=str(claims["oid"]).lower(),
-            upn=str(claims.get("preferred_username") or claims.get("upn") or claims["oid"]).lower()[:120],
+            upn=str(claims.get("preferred_username") or claims.get("upn") or claims["oid"])[:120],
             name=str(claims.get("name") or "")[:120],
-            roles=[r for r in claims.get("roles") or [] if isinstance(r, str)],
-            # Only the groups the catalog names, so the session cookie stays small.
-            groups=sorted({g.lower() for g in claims.get("groups") or [] if isinstance(g, str)} & named),
+            # As the API server takes them: the claim as it is, with its prefix.
+            user=f"{cfg.username_prefix}{claims[cfg.username_claim]}",
+            groups=[f"{cfg.groups_prefix}{g}" for g in (found if isinstance(found, list) else [found]) if isinstance(g, str)][:200],
         )

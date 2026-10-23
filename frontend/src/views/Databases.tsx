@@ -5,7 +5,6 @@ import { Loading, useLoad } from "../components/ui";
 export function Databases({ env }: { env: Environment }) {
   const { me } = useSession();
   const { data, error } = useLoad(() => api.databases(env.name), [env.name]);
-  const cloners = me.environments.filter((e) => e.clone_from.includes(env.name)).map((e) => e.name);
 
   return (
     <>
@@ -14,27 +13,37 @@ export function Databases({ env }: { env: Environment }) {
           {env.name} {env.production && <span className="badge state-declined">production</span>}
         </h1>
         <p className="muted">
-          {env.runs_jobs
-            ? env.production
-              ? "Take a snapshot at any time. A restore waits for a second person, and snapshots stay here."
-              : "Take a snapshot, restore one, or clone one from another environment."
-            : `Only this environment's snapshots are read here${cloners.length ? `, to clone into ${cloners.join(", ")}` : ""}. Nothing runs in ${env.name} from this app.`}
+          {env.production
+            ? "Take a snapshot at any time. A restore waits for a second person, and snapshots stay here."
+            : "Take a snapshot, restore one, or clone one another environment shared with you."}{" "}
+          You see the databases of the namespaces Kubernetes lets you into.
         </p>
       </div>
       {!data ? (
         <Loading error={error} />
       ) : data.length === 0 ? (
         <div className="empty">
-          <p>No databases of yours here.</p>
-          <p className="muted small">The catalog says which team acts on which database; ask the platform team to add yours.</p>
+          <p>No databases in namespaces you can see.</p>
+          <p className="muted small">
+            Kubernetes knows you as <span className="mono">{me.kubernetes.user}</span>
+            {me.kubernetes.groups.length > 0 ? (
+              <>
+                {" "}
+                in <span className="mono">{me.kubernetes.groups.join(", ")}</span>
+              </>
+            ) : (
+              " in no groups"
+            )}
+            . Ask for access to your app's namespace.
+          </p>
         </div>
       ) : (
         <table className="table">
           <thead>
             <tr>
               <th>Database</th>
+              <th>Namespace</th>
               <th>Owner</th>
-              <th>Teams</th>
               <th>Status</th>
               <th>Copy</th>
             </tr>
@@ -47,10 +56,16 @@ export function Databases({ env }: { env: Environment }) {
                     {d.name}
                   </a>
                 </td>
+                <td className="mono small">{d.namespace}</td>
                 <td className="mono small">{d.owner || "—"}</td>
-                <td>{d.teams.join(", ") || <span className="muted">—</span>}</td>
                 <td>
-                  {d.ready === null ? <span className="muted">snapshots only</span> : d.ready ? <span className="status on">ready</span> : <span className="status off" title={d.message}>not ready</span>}
+                  {d.ready ? (
+                    <span className="status on">ready</span>
+                  ) : (
+                    <span className="status off" title={d.message}>
+                      not ready
+                    </span>
+                  )}
                 </td>
                 <td className="mono small">{d.copy ? d.copy.name : <span className="muted">—</span>}</td>
               </tr>

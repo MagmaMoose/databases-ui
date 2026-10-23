@@ -6,11 +6,13 @@ import { Menu } from "../components/Menu";
 import { Loading, message, useLoad } from "../components/ui";
 import { bytes, snapshotTime } from "../format";
 
+type Open = null | { kind: "snapshot" } | { kind: "restore"; snapshot?: string } | { kind: "share"; snapshot: Snapshot } | { kind: "drop" };
+
 export function DatabaseView({ env, name }: { env: Environment; name: string }) {
   const { notify } = useSession();
   const databases = useLoad(() => api.databases(env.name), [env.name]);
   const snapshots = useLoad(() => api.snapshots(env.name, name), [env.name, name]);
-  const [dialog, setDialog] = useState<null | { kind: "snapshot" } | { kind: "restore"; snapshot?: string } | { kind: "drop" }>(null);
+  const [dialog, setDialog] = useState<Open>(null);
   const [busy, setBusy] = useState(false);
   const db = databases.data?.find((d) => d.name === name);
 
@@ -20,12 +22,10 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
       <div className="card">
         <h1>{name}</h1>
         <p className="muted">
-          {env.name} has no database {name} of yours. <a href={`#/${env.name}`}>Back to the databases</a>.
+          {env.name} has no database {name} in a namespace you can see. <a href={`#/${env.name}`}>Back to the databases</a>.
         </p>
       </div>
     );
-
-  const act = db.can_act;
 
   async function dropCopy() {
     setBusy(true);
@@ -46,26 +46,34 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
       <div className="page-head">
         <h1>{db.name}</h1>
         <p className="muted">
-          {env.name}
-          {db.owner && <> · owned by <span className="mono">{db.owner}</span></>}
-          {db.teams.length > 0 && <> · {db.teams.join(", ")}</>}
+          {env.name} · namespace <span className="mono">{db.namespace}</span> · owned by <span className="mono">{db.owner}</span>
+          {db.owner_secret && (
+            <>
+              {" "}
+              (password in Secret <span className="mono">{db.owner_secret}</span>)
+            </>
+          )}
         </p>
-        {act && (
+        {(db.can_snapshot || db.can_restore) && (
           <div className="actions">
-            <button type="button" className="button" onClick={() => setDialog({ kind: "snapshot" })}>
-              Take a snapshot
-            </button>
-            <button type="button" className="button primary" onClick={() => setDialog({ kind: "restore" })}>
-              Restore…
-            </button>
+            {db.can_snapshot && (
+              <button type="button" className="button" onClick={() => setDialog({ kind: "snapshot" })}>
+                Take a snapshot
+              </button>
+            )}
+            {db.can_restore && (
+              <button type="button" className="button primary" onClick={() => setDialog({ kind: "restore" })}>
+                Restore…
+              </button>
+            )}
           </div>
         )}
       </div>
-      {db.ready === false && <p className="notice warn">CloudNativePG has not applied this database: {db.message || "no reason given"}.</p>}
+      {!db.ready && <p className="notice warn">CloudNativePG has not applied this database: {db.message || "no reason given"}.</p>}
       {db.copy && (
         <p className="notice">
           A copy, <span className="mono">{db.copy.name}</span>, holds a restored snapshot{db.copy.ready ? "" : " (being created)"}.{" "}
-          {act && (
+          {db.can_restore && (
             <button type="button" className="button small danger-text" onClick={() => setDialog({ kind: "drop" })}>
               Drop the copy
             </button>
@@ -91,25 +99,25 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
               </tr>
             </thead>
             <tbody>
-              {snapshots.data.map((s) => (
-                <tr key={s.id}>
-                  <td title={s.id}>{snapshotTime(s.id)}</td>
-                  <td>{s.created_by || "—"}</td>
-                  <td>{bytes(s.size)}</td>
-                  <td>{s.note || <span className="muted">—</span>}</td>
-                  <td className="actions-cell">
-                    {act && (
-                      <Menu
-                        label="Actions"
-                        items={[
-                          { label: "Restore…", onSelect: () => setDialog({ kind: "restore", snapshot: s.id }) },
-                          ...(env.downloads ? [{ label: "Download", onSelect: () => (window.location.href = api.downloadUrl(env.name, name, s.id)) }] : []),
-                        ]}
-                      />
-                    )}
-                  </td>
-                </tr>
-              ))}
+              {snapshots.data.map((s) => {
+                const items = [
+                  ...(db.can_restore ? [{ label: "Restore…", onSelect: () => setDialog({ kind: "restore", snapshot: s.id }) }] : []),
+                  ...(db.can_snapshot && env.downloads ? [{ label: "Download", onSelect: () => (window.location.href = api.downloadUrl(env.name, name, s.id)) }] : []),
+                  ...(db.can_snapshot && env.shares_to.length > 0 ? [{ label: "Share with another environment…", onSelect: () => setDialog({ kind: "share", snapshot: s }) }] : []),
+                ];
+                return (
+                  <tr key={s.id}>
+                    <td title={s.id}>{snapshotTime(s.id)}</td>
+                    <td>{s.created_by || "—"}</td>
+                    <td>{bytes(s.size)}</td>
+                    <td>
+                      {s.note || <span className="muted">—</span>}
+                      {s.shared_with.length > 0 && <div className="muted small">shared with {s.shared_with.join(", ")}</div>}
+                    </td>
+                    <td className="actions-cell">{items.length > 0 && <Menu label="Actions" items={items} />}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -119,7 +127,9 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
           <p className="muted small">A restore in place scales these to 0 replicas, and back to what they had afterwards.</p>
           <ul className="list mono small">
             {db.workloads.map((w) => (
-              <li key={w}>{w}</li>
+              <li key={w}>
+                {db.namespace}/{w}
+              </li>
             ))}
           </ul>
         </Section>
@@ -146,6 +156,19 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
             setDialog(null);
             notify(waiting ? "The restore waits for a second person to approve it." : "The restore has started.");
             go(`/${env.name}/activity`);
+          }}
+        />
+      )}
+      {dialog?.kind === "share" && (
+        <ShareDialog
+          env={env}
+          db={db}
+          snapshot={dialog.snapshot}
+          onClose={() => setDialog(null)}
+          onDone={(target) => {
+            setDialog(null);
+            notify(`Shared with ${target}.`);
+            snapshots.reload();
           }}
         />
       )}
@@ -204,10 +227,79 @@ function SnapshotDialog({ env, db, onClose, onDone }: { env: Environment; db: Da
   );
 }
 
+// dev-payments shared with acc suggests acc-payments, for namespaces that start with their environment.
+function namespaceIn(namespace: string, from: string, to: string): string {
+  return namespace.startsWith(`${from}-`) ? `${to}-${namespace.slice(from.length + 1)}` : namespace;
+}
+
+function ShareDialog({ env, db, snapshot, onClose, onDone }: { env: Environment; db: Database; snapshot: Snapshot; onClose: () => void; onDone: (target: string) => void }) {
+  const [target, setTarget] = useState(env.shares_to[0]);
+  const [namespace, setNamespace] = useState(namespaceIn(db.namespace, env.name, env.shares_to[0]));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api.share(env.name, db.name, snapshot.id, { environment: target, namespace: namespace.trim() });
+      onDone(`${namespace.trim()} in ${target}`);
+    } catch (err) {
+      setError(message(err));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog title={`Share the snapshot of ${snapshotTime(snapshot.id)}`} onClose={onClose}>
+      <form className="form" onSubmit={(e) => void submit(e)}>
+        <div className="dialog-body">
+          <p className="muted">Whoever may restore databases in that namespace can then clone this snapshot into one of them. It holds all of {db.name}'s data.</p>
+          <div className="form-row">
+            <div className="field">
+              <label htmlFor="share-env">Environment</label>
+              <select
+                id="share-env"
+                value={target}
+                onChange={(e) => {
+                  setTarget(e.target.value);
+                  setNamespace(namespaceIn(db.namespace, env.name, e.target.value));
+                }}
+              >
+                {env.shares_to.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="share-ns">Namespace there</label>
+              <input id="share-ns" className="mono" required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" value={namespace} onChange={(e) => setNamespace(e.target.value)} />
+            </div>
+          </div>
+          {error && (
+            <p className="notice error" role="alert">
+              {error}
+            </p>
+          )}
+        </div>
+        <footer className="dialog-footer">
+          <button type="button" className="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="button primary" disabled={busy || !namespace.trim()}>
+            Share
+          </button>
+        </footer>
+      </form>
+    </Dialog>
+  );
+}
+
 function RestoreDialog({ env, db, snapshot, onClose, onDone }: { env: Environment; db: Database; snapshot?: string; onClose: () => void; onDone: (waiting: boolean) => void }) {
   const [source, setSource] = useState(env.name);
-  // The databases of the source environment, and the one picked there: the same name if it has one.
-  const [sources, setSources] = useState<{ env: string; databases: Database[]; picked: string } | null>({ env: env.name, databases: [db], picked: db.name });
   const [list, setList] = useState<Snapshot[] | null>(null);
   const [chosen, setChosen] = useState(snapshot ?? "");
   const [into, setInto] = useState<"database" | "copy">("database");
@@ -215,31 +307,14 @@ function RestoreDialog({ env, db, snapshot, onClose, onDone }: { env: Environmen
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const sourceDb = sources?.env === source ? sources.picked : "";
 
+  // This database's own snapshots here, or what another environment shared with its namespace.
   useEffect(() => {
-    if (source === env.name) {
-      setSources({ env: env.name, databases: [db], picked: db.name });
-      return;
-    }
     let live = true;
-    setSources(null);
-    setError("");
-    api.databases(source).then(
-      (found) => live && setSources({ env: source, databases: found, picked: found.some((d) => d.name === db.name) ? db.name : (found[0]?.name ?? "") }),
-      (err) => live && setError(message(err)),
-    );
-    return () => {
-      live = false;
-    };
-  }, [source, env.name, db]);
-
-  useEffect(() => {
     setList(null);
-    if (!sourceDb) return;
-    let live = true;
     setError("");
-    api.snapshots(source, sourceDb).then(
+    const load = source === env.name ? api.snapshots(env.name, db.name) : api.shared(env.name, db.name).then((all) => all.filter((s) => s.environment === source));
+    load.then(
       (found) => {
         if (!live) return;
         setList(found);
@@ -250,17 +325,19 @@ function RestoreDialog({ env, db, snapshot, onClose, onDone }: { env: Environmen
     return () => {
       live = false;
     };
-  }, [source, sourceDb]);
+  }, [source, env.name, db.name]);
 
+  const picked = list?.find((s) => s.id === chosen);
   const inPlace = into === "database";
-  const ready = chosen && reason.trim().length >= 3 && (!inPlace || typed === db.name);
+  const ready = picked && reason.trim().length >= 3 && (!inPlace || typed === db.name);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
+    if (!picked) return;
     setBusy(true);
     setError("");
     try {
-      const job = await api.restore(env.name, db.name, { source_environment: source, source_database: sourceDb, snapshot: chosen, into, reason: reason.trim() });
+      const job = await api.restore(env.name, db.name, { source_environment: source, source_database: picked.database, snapshot: picked.id, into, reason: reason.trim() });
       onDone(job.state === "waiting");
     } catch (err) {
       setError(message(err));
@@ -278,33 +355,24 @@ function RestoreDialog({ env, db, snapshot, onClose, onDone }: { env: Environmen
               <select id="source" value={source} onChange={(e) => setSource(e.target.value)}>
                 {[env.name, ...env.clone_from].map((s) => (
                   <option key={s} value={s}>
-                    {s === env.name ? `${s} (this environment)` : s}
+                    {s === env.name ? `${s}, this database's snapshots` : `${s}, shared with ${db.namespace}`}
                   </option>
                 ))}
               </select>
             </div>
             <div className="field">
-              <label htmlFor="source-db">Database</label>
-              <select id="source-db" value={sourceDb} onChange={(e) => sources && setSources({ ...sources, picked: e.target.value })} disabled={!sources || sources.env !== source}>
-                {(sources?.databases ?? []).map((d) => (
-                  <option key={d.name} value={d.name}>
-                    {d.name}
+              <label htmlFor="snapshot">Snapshot</label>
+              <select id="snapshot" value={chosen} onChange={(e) => setChosen(e.target.value)} disabled={!list || list.length === 0}>
+                {list?.length === 0 && <option value="">{source === env.name ? "No snapshots" : "Nothing shared with this namespace"}</option>}
+                {(list ?? []).map((s) => (
+                  <option key={`${s.database}/${s.id}`} value={s.id}>
+                    {source === env.name ? "" : `${s.database} · `}
+                    {snapshotTime(s.id)} · {bytes(s.size)} · {s.created_by}
+                    {s.note ? ` · ${s.note}` : ""}
                   </option>
                 ))}
               </select>
             </div>
-          </div>
-          <div className="field">
-            <label htmlFor="snapshot">Snapshot</label>
-            <select id="snapshot" value={chosen} onChange={(e) => setChosen(e.target.value)} disabled={!list || list.length === 0}>
-              {list?.length === 0 && <option value="">No snapshots</option>}
-              {(list ?? []).map((s) => (
-                <option key={s.id} value={s.id}>
-                  {snapshotTime(s.id)} · {bytes(s.size)} · {s.created_by}
-                  {s.note ? ` · ${s.note}` : ""}
-                </option>
-              ))}
-            </select>
           </div>
           <fieldset className="field">
             <legend>Into</legend>
@@ -313,7 +381,7 @@ function RestoreDialog({ env, db, snapshot, onClose, onDone }: { env: Environmen
                 <label className={inPlace ? "choice chosen" : "choice"}>
                   <input type="radio" name="into" checked={inPlace} onChange={() => setInto("database")} />
                   <span>
-                    <strong className="mono">{db.name}</strong>, replacing what is in it
+                    <strong className="mono">{db.name}</strong>, replacing everything its owner has there
                     {db.workloads.length > 0 && <span className="muted small"> · scales {db.workloads.join(", ")} to 0 while it runs</span>}
                   </span>
                 </label>
@@ -341,7 +409,7 @@ function RestoreDialog({ env, db, snapshot, onClose, onDone }: { env: Environmen
             </div>
           )}
           <p className="hint">
-            pg_restore runs in one transaction: if anything fails, nothing changes. Tables made after the snapshot was taken stay as they are.
+            One transaction: the database ends up as the snapshot was, or if anything fails, as it is now.
             {env.production && " In production a second person approves it before it starts."}
           </p>
           {error && (

@@ -1,7 +1,8 @@
 """The web app: sign-in routes, the JSON API the frontend calls, and the built frontend itself.
 
 Writes need the session's CSRF token in X-CSRF-Token and this origin in Origin, on top of the
-SameSite=Strict session cookie. What a person may see and do is decided in service.py.
+SameSite=Strict session cookie. What a person may see and do is Kubernetes' answer, asked in
+service.py for the user and groups the session carries.
 """
 
 import hmac
@@ -28,9 +29,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .blob import BlobError, Container
-from .catalog import DATABASE, Kubernetes
+from .catalog import DATABASE
 from .config import Branding, Config
-from .entra import AppToken, Entra, app_credential
+from .entra import AppToken, Entra, app_credential, federated_credential
 from .kube import Kube, KubeError
 from .oidc import SignInError
 from .service import SNAPSHOT_ID, Actor, Console, ConsoleError
@@ -106,6 +107,11 @@ class Restore(BaseModel):
     reason: str = Field(min_length=3, max_length=300)
 
 
+class Share(BaseModel):
+    environment: str = Field(pattern=r"^[a-z0-9-]{1,32}$")
+    namespace: str = Field(pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
 class Reason(BaseModel):
     reason: str = Field(default="", max_length=300)
 
@@ -115,16 +121,16 @@ def _log(event: str, **fields: Any) -> None:
 
 
 def build_console(cfg: Config, http: httpx.AsyncClient, *, kube_transport: httpx.AsyncBaseTransport | None = None, now=lambda: datetime.now(UTC)) -> Console:
-    """One Kubernetes client per environment that runs Jobs, and one container per environment."""
-    token = None if cfg.storage_sas else AppToken(http, token_url=cfg.token_url, client_id=cfg.client_id, credential=lambda: app_credential(cfg))
-    kube: dict[str, Kube] = {}
-    storage: dict[str, Container] = {}
-    for env in cfg.catalog.environments.values():
-        storage[env.name] = Container(http, env.storage.url, token=token, sas=cfg.storage_sas)
-        if isinstance(env.kubernetes, Kubernetes):
-            kube[env.name] = Kube(server=env.kubernetes.server, token_file=env.kubernetes.token_file, ca_file=env.kubernetes.ca_file, transport=kube_transport)
-        elif env.kubernetes == "in-cluster":
-            kube[env.name] = Kube.in_cluster(transport=kube_transport)
+    """This cluster's API server for the environments that run here, and a container per environment."""
+    token = None
+    if not cfg.storage_sas:
+        # A storage identity of its own trusts the same service-account token as the sign-in app.
+        own = cfg.storage_client_id not in ("", cfg.client_id)
+        credential = (lambda: federated_credential(str(cfg.federated_token_file))) if own else (lambda: app_credential(cfg))
+        token = AppToken(http, token_url=cfg.token_url, client_id=cfg.storage_client_id or cfg.client_id, credential=credential)
+    here = Kube.in_cluster(transport=kube_transport)
+    kube = {env.name: here for env in cfg.catalog.environments.values() if env.runs_jobs}
+    storage = {env.name: Container(http, env.storage.url, token=token, sas=cfg.storage_sas) for env in cfg.catalog.environments.values()}
     return Console(cfg, kube, storage, now=now)
 
 
@@ -212,10 +218,9 @@ def create_app(cfg: Config, transport: httpx.AsyncBaseTransport | None = None, *
     Writable = Annotated[dict[str, Any], Depends(writable)]
 
     def actor(data: dict[str, Any]) -> Actor:
-        roles = data.get("roles") or []
         return Actor(
-            oid=str(data["oid"]), upn=str(data.get("upn", "")), name=str(data.get("name", "")), groups=frozenset(data.get("groups") or []),
-            admin=cfg.admin_role in roles, auditor=cfg.auditor_role in roles,
+            oid=str(data["oid"]), upn=str(data.get("upn", "")), name=str(data.get("name", "")),
+            user=str(data.get("user", "")), groups=tuple(str(g) for g in data.get("groups") or []),
         )  # fmt: skip
 
     # ── Sign-in ───────────────────────────────────────────────────────────────────────
@@ -262,10 +267,10 @@ def create_app(cfg: Config, transport: httpx.AsyncBaseTransport | None = None, *
         except SignInError as err:
             _log("sign-in failed", status=err.status, reason=str(err))
             return _back(auth_error=str(err))
-        data = {"oid": signed.oid, "upn": signed.upn, "name": signed.name, "roles": signed.roles, "groups": signed.groups, "csrf": secrets.token_urlsafe(32)}
+        data = {"oid": signed.oid, "upn": signed.upn, "name": signed.name, "user": signed.user, "groups": signed.groups, "csrf": secrets.token_urlsafe(32)}
         response = _back()
         cookies.write_session(request, response, data, cfg.session_seconds)
-        _log("signed in", user=signed.oid, upn=signed.upn, roles=signed.roles, groups=len(signed.groups))
+        _log("signed in", oid=signed.oid, user=signed.user, groups=len(signed.groups))
         return response
 
     @app.post("/auth/logout")
@@ -286,11 +291,16 @@ def create_app(cfg: Config, transport: httpx.AsyncBaseTransport | None = None, *
             "expires": data.get("exp"),
             "version": cfg.version,
             "release_notes": release_notes(cfg.version),
-            "admin": who.admin,
-            "auditor": who.auditor,
-            "teams": [{"id": t.id, "name": t.name} for t in cfg.catalog.teams_of(who.groups)],
+            "kubernetes": {"user": who.user, "groups": list(who.groups)},
             "environments": [
-                {"name": e.name, "production": e.production, "runs_jobs": e.runs_jobs, "clone_from": e.clone_from, "downloads": not e.production}
+                {
+                    "name": e.name,
+                    "production": e.production,
+                    "runs_jobs": e.runs_jobs,
+                    "clone_from": e.clone_from,
+                    "shares_to": cfg.catalog.cloning_from(e.name),
+                    "downloads": not e.production,
+                }
                 for e in cfg.catalog.environments.values()
             ],
         }
@@ -306,6 +316,18 @@ def create_app(cfg: Config, transport: httpx.AsyncBaseTransport | None = None, *
     @app.post("/api/environments/{env}/databases/{db}/snapshots", status_code=201)
     async def take_snapshot(env: EnvName, db: DbName, body: Note, data: Writable) -> dict[str, Any]:
         return await console.take_snapshot(actor(data), env, db, body.note.strip())
+
+    @app.get("/api/environments/{env}/users")
+    async def users(env: EnvName, data: Session) -> dict[str, Any]:
+        return {"users": await console.users(actor(data), env)}
+
+    @app.post("/api/environments/{env}/databases/{db}/snapshots/{sid}/share")
+    async def share(env: EnvName, db: DbName, sid: SnapshotId, body: Share, data: Writable) -> dict[str, Any]:
+        return await console.share(actor(data), env, db, sid, environment=body.environment, namespace=body.namespace)
+
+    @app.get("/api/environments/{env}/databases/{db}/shared")
+    async def shared(env: EnvName, db: DbName, data: Session) -> dict[str, Any]:
+        return {"snapshots": await console.shared(actor(data), env, db)}
 
     @app.post("/api/environments/{env}/databases/{db}/restore", status_code=201)
     async def restore(env: EnvName, db: DbName, body: Restore, data: Writable) -> dict[str, Any]:

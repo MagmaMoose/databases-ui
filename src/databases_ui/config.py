@@ -17,7 +17,10 @@ from .catalog import Catalog, CatalogError, load_catalog
 _GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _HOST = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
 _COLOUR = re.compile(r"^#[0-9a-fA-F]{6}$")
-_ROLE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
+_CLAIM = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_PREFIX = re.compile(r"^[A-Za-z0-9_.:@/#-]{0,64}$")
+# A label key: an optional DNS-subdomain prefix and a name, as Kubernetes takes them.
+_LABEL_KEY = re.compile(r"^([a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$")
 _K8S_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 _SECRET_REF = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?/[A-Za-z0-9._-]{1,253}$")
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}  # DevSkim: ignore DS162092 - plain http is allowed on loopback, for local development
@@ -55,8 +58,17 @@ class Config:
     # the Secret that holds the same token in each environment's namespace, for the Jobs.
     storage_sas: str = ""
     storage_sas_secret: str = ""
-    admin_role: str = "Admin"
-    auditor_role: str = "Auditor"
+    # The identity that reaches storage, for this server and the Jobs: the sign-in app's own, or a
+    # separate one that trusts the same service-account tokens.
+    storage_client_id: str = ""
+    # The label on a Database resource that names the namespace whose people may act on it.
+    namespace_label: str = "databases-ui/namespace"
+    # How the cluster's API server names a person from their Entra ID token: these must match its
+    # authentication configuration, or the access reviews ask about someone else.
+    username_claim: str = "preferred_username"
+    username_prefix: str = "oidc:"
+    groups_claim: str = "groups"
+    groups_prefix: str = "oidc:"
     static_dir: Path | None = None
     port: int = 8080
     version: str = "dev"
@@ -156,12 +168,21 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         # A Job can't use the client secret: workload identity is how it reaches storage.
         raise ConfigError("the Jobs reach storage through workload identity (AZURE_FEDERATED_TOKEN_FILE) or a SAS (DATABASES_UI_STORAGE_SAS)")
 
-    roles = {}
-    for key, default in (("admin", "Admin"), ("auditor", "Auditor")):
-        name = f"DATABASES_UI_{key.upper()}_ROLE"
-        roles[f"{key}_role"] = env.get(name, default).strip()
-        if not _ROLE.match(roles[f"{key}_role"]):
-            raise ConfigError(f"{name} must be an app role value, such as {default}")
+    client_id = _guid(env, "AZURE_CLIENT_ID")
+    storage_client_id = _guid(env, "DATABASES_UI_STORAGE_CLIENT_ID") if env.get("DATABASES_UI_STORAGE_CLIENT_ID", "").strip() else client_id
+
+    label = env.get("DATABASES_UI_NAMESPACE_LABEL", "databases-ui/namespace").strip()
+    if not _LABEL_KEY.match(label):
+        raise ConfigError("DATABASES_UI_NAMESPACE_LABEL must be a label key, such as databases-ui/namespace")
+    mapping = {}
+    for key, default in (("username_claim", "preferred_username"), ("groups_claim", "groups")):
+        mapping[key] = env.get(f"DATABASES_UI_{key.upper()}", default).strip()
+        if not _CLAIM.match(mapping[key]):
+            raise ConfigError(f"DATABASES_UI_{key.upper()} must be a claim name, such as {default}")
+    for key in ("username_prefix", "groups_prefix"):
+        mapping[key] = env.get(f"DATABASES_UI_{key.upper()}", "oidc:").strip()
+        if not _PREFIX.match(mapping[key]):
+            raise ConfigError(f"DATABASES_UI_{key.upper()} must be a prefix such as oidc:, or empty")
 
     try:
         hours = int(env.get("DATABASES_UI_SESSION_HOURS", "8"))
@@ -184,7 +205,9 @@ def load_config(env: dict[str, str] | None = None) -> Config:
 
     return Config(
         tenant_id=_guid(env, "AZURE_TENANT_ID"),
-        client_id=_guid(env, "AZURE_CLIENT_ID"),
+        client_id=client_id,
+        storage_client_id=storage_client_id,
+        namespace_label=label,
         authority=_authority(env.get("AZURE_AUTHORITY_HOST", "")),
         federated_token_file=Path(token_file) if token_file else None,
         client_secret=secret or None,
@@ -200,5 +223,5 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         port=port,
         version=env.get("APP_VERSION", "dev"),
         branding=Branding(**colours),
-        **roles,
+        **mapping,
     )

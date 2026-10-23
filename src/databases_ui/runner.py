@@ -3,9 +3,10 @@ in the Job (jobs.py).
 
 snapshot  pg_dump in the custom format, streamed into a block blob that is committed, with who
           asked and why as its metadata, only once pg_dump has succeeded.
-restore   the snapshot streamed into pg_restore in one transaction, so on any error nothing
-          changes. In place, the workloads that use the database go to 0 replicas first and back
-          to what they had afterwards; for a copy, it first waits for the database to exist.
+restore   in one transaction, everything the owner role owns is dropped and the snapshot's
+          script, from pg_restore, runs: the database ends up as it was when the snapshot was
+          taken, or on any error as it was before. In place, the workloads that use it go to 0
+          replicas first and back afterwards; for a copy, it first waits for the database.
 
 Nothing goes through `kubectl exec` or a disk. The outcome goes to the pod's termination
 message, which the server shows, and to the environment's audit log.
@@ -14,6 +15,7 @@ message, which the server shows, and to the environment's audit log.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -152,6 +154,64 @@ async def scale_up(kube: Kube, scaled: list[tuple[str, int]]) -> None:
             _say("could not scale back", workload=path, replicas=replicas, reason=str(err))
 
 
+def _stop(*procs: asyncio.subprocess.Process) -> None:
+    for proc in procs:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+
+async def apply(chunks: AsyncIterator[bytes], database: str) -> None:
+    """The snapshot into `database` in one transaction: everything the owner role owns is dropped,
+    then pg_restore's script runs, and COMMIT follows only once pg_restore has succeeded. On any
+    error psql stops, its connection closes and PostgreSQL rolls the lot back."""
+    run = await asyncio.create_subprocess_exec(
+        "psql", "--no-password", "--no-psqlrc", "--quiet", "-v", "ON_ERROR_STOP=1", f"--dbname={database}", "--file=-",
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    script = await asyncio.create_subprocess_exec(
+        "pg_restore", "--format=custom", "--clean", "--if-exists", "--no-owner", "--no-acl", "--file=-",
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    if run.stdin is None or run.stderr is None or script.stdin is None or script.stdout is None or script.stderr is None:
+        raise JobFailed("psql or pg_restore started without its pipes")
+    run_errors, script_errors = asyncio.create_task(run.stderr.read()), asyncio.create_task(script.stderr.read())
+    to_psql, to_restore, from_restore = run.stdin, script.stdin, script.stdout
+
+    async def feed() -> None:
+        try:
+            async for chunk in chunks:
+                to_restore.write(chunk)
+                await to_restore.drain()
+            to_restore.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # pg_restore stopped reading; its exit status says why
+        except BaseException:
+            # The download broke off: psql goes before it sees COMMIT, so nothing changes.
+            _stop(run, script)
+            raise
+
+    async def relay() -> None:
+        try:
+            to_psql.write(b"BEGIN;\nDROP OWNED BY CURRENT_USER;\n")
+            while data := await from_restore.read(READ):
+                to_psql.write(data)
+                await to_psql.drain()
+            if await script.wait() == 0:
+                to_psql.write(b"\nCOMMIT;\n")
+                await to_psql.drain()
+            to_psql.close()
+        except (BrokenPipeError, ConnectionResetError):
+            # psql stopped on an error: pg_restore must not block on a full pipe.
+            _stop(script)
+
+    await asyncio.gather(feed(), relay())
+    if await script.wait() != 0:
+        await run.wait()
+        raise JobFailed(f"pg_restore exited {script.returncode}, nothing changed: {_tail(await script_errors)}")
+    if await run.wait() != 0:
+        raise JobFailed(f"the restore failed, nothing changed: {_tail(await run_errors)}")
+
+
 async def restore(env: Mapping[str, str], container: Container, kube: Kube | None) -> dict[str, Any]:
     await wait_for_database(WAIT_SECONDS if env.get("DBUI_WAIT_FOR_DATABASE") else REACH_SECONDS)
     scaled: list[tuple[str, int]] = []
@@ -161,27 +221,7 @@ async def restore(env: Mapping[str, str], container: Container, kube: Kube | Non
         ended = await psql("select count(pg_terminate_backend(pid)) from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid() and usename = current_user")
         _say("sessions ended", count=ended)
         async with container.download(env["DBUI_BLOB"]) as (size, chunks):
-            proc = await _exec(
-                "pg_restore", "--format=custom", "--clean", "--if-exists", "--no-owner", "--no-acl", "--single-transaction", "--no-password",
-                f"--dbname={env['PGDATABASE']}", stdin=subprocess.PIPE,
-            )  # fmt: skip
-            stdin, stderr = proc.stdin, proc.stderr
-            if stdin is None or stderr is None:
-                raise JobFailed("pg_restore started without its pipes")
-            errors = asyncio.create_task(stderr.read())
-            fed = 0
-            try:
-                async for chunk in chunks:
-                    stdin.write(chunk)
-                    await stdin.drain()
-                    fed += len(chunk)
-                stdin.close()
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # pg_restore stopped reading; its exit status says why
-            if await proc.wait() != 0:
-                raise JobFailed(f"pg_restore exited {proc.returncode}, nothing changed: {_tail(await errors)}")
-            if fed != size:
-                raise JobFailed(f"read {fed} of {size} bytes of the snapshot")
+            await apply(chunks, env["PGDATABASE"])
     finally:
         if kube is not None:
             await scale_up(kube, scaled)
@@ -212,7 +252,8 @@ async def run(env: Mapping[str, str], *, transport: httpx.AsyncBaseTransport | N
             # The environment's own container, which for a clone is not the snapshot's.
             await audit.record(
                 _container(env, env["DBUI_AUDIT_URL"], http), environment=env.get("DBUI_ENVIRONMENT", ""), actor=env.get("DBUI_REQUESTED_BY", ""), action=f"{action}.{outcome['result']}",
-                database=env.get("DBUI_DATABASE", ""), job=env.get("DBUI_JOB", ""), snapshot=env.get("DBUI_BLOB", ""), detail=outcome.get("reason", ""),
+                database=env.get("DBUI_DATABASE", ""), namespace=env.get("DBUI_NAMESPACE", ""), job=env.get("DBUI_JOB", ""), snapshot=env.get("DBUI_BLOB", ""),
+                detail=outcome.get("reason", ""),
             )  # fmt: skip
         except (SignInError, KeyError) as err:
             _say("audit write failed", reason=str(err))

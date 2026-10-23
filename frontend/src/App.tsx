@@ -4,6 +4,7 @@ import { Activity } from "./views/Activity";
 import { Audit } from "./views/Audit";
 import { DatabaseView } from "./views/DatabaseView";
 import { Databases } from "./views/Databases";
+import { Users } from "./views/Users";
 
 type Toast = { id: number; message: string; kind: "info" | "error" };
 
@@ -88,7 +89,7 @@ export function App() {
         <div className="card sign-in">
           <Logo />
           <h1>Databases UI</h1>
-          <p className="muted">{state === "ended" ? "Your session has ended." : "Sign in with your work account to snapshot, restore and clone your team's databases."}</p>
+          <p className="muted">{state === "ended" ? "Your session has ended." : "Sign in with your work account to snapshot, restore and clone the databases of your namespaces."}</p>
           {authError && (
             <p className="notice error" role="alert">
               {authError}
@@ -103,9 +104,12 @@ export function App() {
   }
 
   const [envName, page = "", id] = route.path;
-  const env = me.environments.find((e) => e.name === envName) ?? me.environments.find((e) => e.runs_jobs) ?? me.environments[0];
+  // Only the environments of this cluster: the others are where shared snapshots come from.
+  const here = me.environments.filter((e) => e.runs_jobs);
+  const env = here.find((e) => e.name === envName) ?? here[0];
   const pages = [
     { match: "", label: "Databases" },
+    { match: "users", label: "Users" },
     { match: "activity", label: "Activity" },
     { match: "audit", label: "Audit log" },
   ];
@@ -128,7 +132,7 @@ export function App() {
         <div className="layout">
           <nav className="vaults" aria-label="Environments">
             <select className="vault-select" aria-label="Environment" value={env.name} onChange={(e) => go(`/${e.target.value}`)}>
-              {me.environments.map((e) => (
+              {here.map((e) => (
                 <option key={e.name} value={e.name}>
                   {e.name}
                   {e.production ? " (production)" : ""}
@@ -138,7 +142,7 @@ export function App() {
             <div className="nav-group">
               <p className="nav-title">Environments</p>
               <ul>
-                {me.environments.map((e) => (
+                {here.map((e) => (
                   <li key={e.name}>
                     <a href={`#/${e.name}`} aria-current={e.name === env.name ? "page" : undefined}>
                       {e.name} {e.production && <span className="badge state-declined">production</span>}
@@ -147,20 +151,18 @@ export function App() {
                 ))}
               </ul>
             </div>
-            {env.runs_jobs && (
-              <div className="nav-group">
-                <p className="nav-title">{env.name}</p>
-                <ul>
-                  {pages.map((p) => (
-                    <li key={p.match}>
-                      <a href={`#/${env.name}${p.match ? `/${p.match}` : ""}`} aria-current={(page === "databases" ? "" : page) === p.match ? "page" : undefined}>
-                        {p.label}
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            <div className="nav-group">
+              <p className="nav-title">{env.name}</p>
+              <ul>
+                {pages.map((p) => (
+                  <li key={p.match}>
+                    <a href={`#/${env.name}${p.match ? `/${p.match}` : ""}`} aria-current={(page === "databases" ? "" : page) === p.match ? "page" : undefined}>
+                      {p.label}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
             <p className="muted small version">
               {me.release_notes ? (
                 <a href={me.release_notes} target="_blank" rel="noreferrer" title="Release notes">
@@ -169,7 +171,6 @@ export function App() {
               ) : (
                 me.version
               )}
-              {me.auditor && !me.admin && " · read-only"}
             </p>
           </nav>
           <main className="content">
@@ -193,6 +194,7 @@ export function App() {
 
 function Page({ env, page, id }: { env: Environment; page: string; id?: string }) {
   if (page === "databases" && id) return <DatabaseView key={`${env.name}/${id}`} env={env} name={id} />;
+  if (page === "users") return <Users key={env.name} env={env} />;
   if (page === "activity") return <Activity key={env.name} env={env} />;
   if (page === "audit") return <Audit key={env.name} env={env} />;
   if (page === "" || page === "databases") return <Databases key={env.name} env={env} />;

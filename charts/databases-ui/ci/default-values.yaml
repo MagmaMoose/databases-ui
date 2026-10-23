@@ -2,26 +2,24 @@
 azure:
   tenantId: 11111111-2222-3333-4444-555555555555
   clientId: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+  storageClientId: cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee
 config:
   publicOrigin: https://databases.example.com
+  namespaceLabel: example.com/namespace
+  kubernetesGroups:
+    claim: roles
+    prefix: "oidc:"
 catalog:
   content:
     environments:
       - name: dev
         storage:
           url: https://examplesnapshots.blob.core.windows.net/dev
-      - name: prd
-        production: true
+        cloneFrom: [acc]
+      - name: acc
+        kubernetes: none
         storage:
-          url: https://examplesnapshots.blob.core.windows.net/prd
-    teams:
-      - id: payments
-        name: Payments
-        groups: [6f1c2b7e-3a44-4d0e-9a51-2b8e0c7d9f10]
-        databases:
-          - name: payments
-            workloads:
-              - deployment/{env}-payments/api
+          url: https://examplesnapshots.blob.core.windows.net/acc
 rbac:
   namespaces: [database]
 jobs:

@@ -1,8 +1,8 @@
 """Signing in with OpenID Connect: authorization code flow with PKCE, as a confidential client.
 
 What differs between identity providers lives in a subclass: the endpoints, the app's own
-credential, which claims have to hold, and where a person's roles and groups come from. Entra ID
-is in entra.py. Signing in needs only the ID token.
+credential, which claims have to hold, and who the person is to Kubernetes. Entra ID is in
+entra.py. Signing in needs only the ID token.
 
 The ID token is verified against the provider's published keys although it arrives straight
 from the token endpoint over TLS (OIDC Core 3.1.3.7 would allow skipping that): issuer,
@@ -37,7 +37,9 @@ class SignIn:
     oid: str
     upn: str
     name: str
-    roles: list[str]
+    # Who Kubernetes takes this person for: the user and groups its API server derives from the
+    # same ID token.
+    user: str
     groups: list[str]
 
 

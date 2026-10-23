@@ -7,6 +7,7 @@ const ACTIONS: Record<string, string> = {
   "snapshot.succeeded": "snapshot taken",
   "snapshot.failed": "snapshot failed",
   "snapshot.downloaded": "downloaded a snapshot",
+  "snapshot.shared": "shared a snapshot",
   "restore.requested": "asked for a restore",
   "restore.approved": "approved a restore",
   "restore.declined": "declined a restore",
@@ -21,7 +22,7 @@ function detail(e: AuditEntry, env: string): string {
   const parts: string[] = [];
   const snap = /^(?:([a-z0-9-]+)\/)?snapshots\/([^/]+)\/([^/]+)\.dump$/.exec(e.snapshot ?? "");
   if (snap) parts.push(`${snap[1] && snap[1] !== env ? `${snap[1]}/${snap[2]}, ` : ""}snapshot of ${snapshotTime(snap[3])}`);
-  if (e.target) parts.push(e.action === "copy.dropped" ? e.target : `into ${e.target}`);
+  if (e.target) parts.push(e.action === "copy.dropped" ? e.target : e.action === "snapshot.shared" ? `with ${e.target}` : `into ${e.target}`);
   if (e.detail) parts.push(e.detail);
   return parts.join(" · ");
 }

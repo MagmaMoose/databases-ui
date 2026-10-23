@@ -1,5 +1,32 @@
 {{- $fullname := include "databases-ui.fullname" . }}
 {{- $labels := include "databases-ui.labels" . }}
+# Who may act on a database is the API server's answer: the server asks it, with a
+# SubjectAccessReview, about the user and groups a person's ID token gives them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-access-review
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-access-review
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-access-review
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "databases-ui.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
 {{- range $ns := .Values.rbac.namespaces }}
 ---
 # The server reads the Database resources and the Cluster's managed roles, creates and approves

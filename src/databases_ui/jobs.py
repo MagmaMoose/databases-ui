@@ -36,6 +36,8 @@ class Target:
     password_secret: str
     ca_secret: str
     host: str
+    # The app's namespace, whose people may act on the database.
+    namespace: str
 
 
 def name_for(action: str) -> str:
@@ -52,7 +54,7 @@ def _storage_env(cfg: Config) -> list[dict[str, Any]]:
         return [{"name": "DBUI_STORAGE_SAS", "valueFrom": {"secretKeyRef": {"name": secret, "key": key}}}]
     return [
         {"name": "AZURE_TENANT_ID", "value": cfg.tenant_id},
-        {"name": "AZURE_CLIENT_ID", "value": cfg.client_id},
+        {"name": "AZURE_CLIENT_ID", "value": cfg.storage_client_id or cfg.client_id},
         {"name": "AZURE_AUTHORITY_HOST", "value": cfg.authority},
         {"name": "AZURE_FEDERATED_TOKEN_FILE", "value": f"{TOKEN_DIR}/azure-identity-token"},
     ]
@@ -76,12 +78,13 @@ def build(
     wait_for_database: bool = False,
 ) -> dict[str, Any]:
     """The Job for one action. `database` is the catalog's name, `target.database` the one written to."""
-    labels = {MANAGED_BY: APP, f"{PREFIX}environment": env.name, f"{PREFIX}database": database, f"{PREFIX}action": action}
+    labels = {MANAGED_BY: APP, f"{PREFIX}environment": env.name, f"{PREFIX}database": database, f"{PREFIX}namespace": target.namespace, f"{PREFIX}action": action}
     variables: list[dict[str, Any]] = [
         {"name": "DBUI_ACTION", "value": action},
         {"name": "DBUI_JOB", "value": name},
         {"name": "DBUI_ENVIRONMENT", "value": env.name},
         {"name": "DBUI_DATABASE", "value": database},
+        {"name": "DBUI_NAMESPACE", "value": target.namespace},
         {"name": "DBUI_REQUESTED_BY", "value": requested_by},
         {"name": "DBUI_BLOB_URL", "value": blob_url},
         {"name": "DBUI_BLOB", "value": blob},

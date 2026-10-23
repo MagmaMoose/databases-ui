@@ -6,7 +6,11 @@ registration ({{ .Values.azure.clientId }}):
   {{ .Values.config.publicOrigin }}/auth/callback
 {{- if .Values.azure.workloadIdentity.enabled }}
 
-and federated credentials, audience {{ .Values.azure.workloadIdentity.audience }}, for these subjects:
+and federated credentials, audience {{ .Values.azure.workloadIdentity.audience }}, on the app for the server:
+
+  system:serviceaccount:{{ .Release.Namespace }}:{{ include "databases-ui.serviceAccountName" . }}
+
+and on the storage identity ({{ .Values.azure.storageClientId | default .Values.azure.clientId }}) for the server and the Jobs:
 
   system:serviceaccount:{{ .Release.Namespace }}:{{ include "databases-ui.serviceAccountName" . }}
 {{- range .Values.rbac.namespaces }}
