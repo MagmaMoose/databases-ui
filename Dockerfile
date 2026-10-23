@@ -24,12 +24,11 @@ RUN uv sync --locked --no-dev --no-editable
 FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 
 # pg_dump, pg_restore and psql from the PostgreSQL project's repository: pg_dump has to be at
-# least the server's version, and Debian's own lags behind. The signing key is checked by hash.
-ADD --checksum=sha256:0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76 \
-    https://www.postgresql.org/media/keys/ACCC4CF8.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+# least the server's version, and Debian's own lags behind. Its signing key is kept here
+# (fingerprint B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8), so a rotation is a reviewed change.
+COPY --chmod=0644 docker/apt.postgresql.org.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
 # hadolint ignore=DL3008
 RUN set -eux; \
-    chmod 0644 /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
     codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"; \
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" > /etc/apt/sources.list.d/pgdg.list; \
     apt-get update; \
