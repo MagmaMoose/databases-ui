@@ -26,7 +26,7 @@ FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6
 # pg_dump, pg_restore and psql from the PostgreSQL project's repository: pg_dump has to be at
 # least the server's version, and Debian's own lags behind. Its signing key is kept here
 # (fingerprint B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8), so a rotation is a reviewed change.
-COPY --chmod=0644 docker/apt.postgresql.org.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+COPY docker/apt.postgresql.org.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
 # hadolint ignore=DL3008
 RUN set -eux; \
     codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"; \
