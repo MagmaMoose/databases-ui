@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import xml.etree.ElementTree as ET  # nosec B405 - parses Azure Storage's own listings, nothing a person writes
+# Only Azure Storage's own List Blobs answers are parsed, from the operator's configured endpoint:
+# ElementTree resolves no external entities, and expat (2.4.1 and later) caps entity expansion.
+import xml.etree.ElementTree as ET  # nosec B405 # nosemgrep: python.lang.security.use-defused-xml.use-defused-xml
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass

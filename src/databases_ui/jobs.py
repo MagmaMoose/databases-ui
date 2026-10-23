@@ -21,7 +21,7 @@ from .config import Config
 PREFIX = "databases-ui/"
 MANAGED_BY = "app.kubernetes.io/managed-by"
 APP = "databases-ui"
-TOKEN_DIR = "/var/run/secrets/azure/tokens"
+TOKEN_DIR = "/var/run/secrets/azure/tokens"  # nosec B105 - where the kubelet mounts the token, not a token
 DEADLINE_SECONDS = 6 * 3600
 KEEP_SECONDS = 7 * 86400
 
@@ -98,7 +98,7 @@ def build(
         {"name": "PGSSLROOTCERT", "value": "/etc/databases-ui/ca/ca.crt"},
         {"name": "PGAPPNAME", "value": "databases-ui"},
         {"name": "PGCONNECT_TIMEOUT", "value": "15"},
-        {"name": "HOME", "value": "/tmp"},
+        {"name": "HOME", "value": "/tmp"},  # nosec B108 - the pod's own emptyDir, mounted below
         *_storage_env(cfg),
     ]
     if metadata:
@@ -112,7 +112,7 @@ def build(
         # The server's CA certificate only: the Secret also holds the CA's key.
         {"name": "ca", "secret": {"secretName": target.ca_secret, "defaultMode": 0o440, "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
     ]
-    mounts = [{"name": "tmp", "mountPath": "/tmp"}, {"name": "ca", "mountPath": "/etc/databases-ui/ca", "readOnly": True}]
+    mounts = [{"name": "tmp", "mountPath": "/tmp"}, {"name": "ca", "mountPath": "/etc/databases-ui/ca", "readOnly": True}]  # nosec B108 - an emptyDir no other pod shares
     if not cfg.storage_sas_secret:
         volumes.append(
             {

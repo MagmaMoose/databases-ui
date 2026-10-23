@@ -49,7 +49,7 @@ class AppToken:
         self._client_id = client_id
         self._credential = credential
         self._scope = scope
-        self._token = ""
+        self._token = ""  # nosec B105 - no token fetched yet; this is the empty cache, not a credential
         self._expires = 0.0
         self._lock = asyncio.Lock()
 
