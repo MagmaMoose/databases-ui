@@ -124,12 +124,12 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
       </Section>
       {db.workloads.length > 0 && (
         <Section title="Workloads">
-          <p className="muted small">A restore in place scales these to 0 replicas, and back to what they had afterwards.</p>
+          <p className="muted small">
+            A restore in place scales these, in <span className="mono">{db.namespace}</span>, to 0 replicas, and back to what they had afterwards.
+          </p>
           <ul className="list mono small">
             {db.workloads.map((w) => (
-              <li key={w}>
-                {db.namespace}/{w}
-              </li>
+              <li key={w}>{w}</li>
             ))}
           </ul>
         </Section>
