@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+.pytest_cache
+.coverage
+**/__pycache__
+tests
+examples
+charts
+docker-bake.hcl
+frontend/node_modules
+frontend/dist

@@ -1,0 +1,16 @@
+# The smallest install: a client secret for sign-in, a SAS for storage and your own catalog.
+azure:
+  tenantId: 11111111-2222-3333-4444-555555555555
+  clientId: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+  workloadIdentity:
+    enabled: false
+  clientSecret:
+    existingSecret: databases-ui-entra
+config:
+  publicOrigin: https://databases.example.com
+catalog:
+  existingConfigMap: databases-ui-catalog
+storage:
+  sas:
+    existingSecret: databases-ui-storage
+replicaCount: 1

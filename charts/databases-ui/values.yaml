@@ -1,0 +1,165 @@
+# databases-ui. Required: azure.tenantId, azure.clientId, config.publicOrigin and the catalog. The
+# setup is in the repository README.
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/magmamoose/databases-ui
+  # Defaults to the chart's appVersion.
+  tag: ""
+  # sha256:..., pins the image whatever the tag says. The Jobs run the same image.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+azure:
+  # The Entra ID tenant (a GUID) and the client id of the app registration people sign in to: the
+  # one the cluster's API server trusts, so the ID token names them as Kubernetes does.
+  tenantId: ""
+  clientId: ""
+  # The identity that reaches storage, for the server and the Jobs. Empty: the sign-in app. A
+  # managed identity or app of its own needs federated credentials for the same service accounts.
+  storageClientId: ""
+  # Leave empty for the public cloud (https://login.microsoftonline.com).
+  authorityHost: ""
+  # The app authenticates with its own service-account token, which Entra ID accepts through a
+  # federated credential (issuer: the cluster's service-account issuer, subject:
+  # system:serviceaccount:<namespace>:<service account>). The Jobs do the same as
+  # jobs.serviceAccountName in each namespace of rbac.namespaces.
+  workloadIdentity:
+    enabled: true
+    audience: api://AzureADTokenExchange
+  # Used instead when workloadIdentity.enabled is false: a Secret holding a client secret. The
+  # Jobs then need storage.sas.
+  clientSecret:
+    existingSecret: ""
+    key: client-secret
+
+config:
+  # Where people open the UI, scheme and host only. The redirect URI to register on the app is
+  # <publicOrigin>/auth/callback.
+  publicOrigin: ""
+  # How long a sign-in lasts, 1 to 24.
+  sessionHours: 8
+  # The label on a Database resource that names the namespace of the app it belongs to. Who may do
+  # what with it is Kubernetes RBAC in that namespace; without the label, in the Cluster's own.
+  namespaceLabel: databases-ui/namespace
+  # How the cluster's API server names people from their ID token, as in its authentication
+  # configuration: the access reviews ask about the same user and groups, so these must match.
+  kubernetesUser:
+    claim: preferred_username
+    prefix: "oidc:"
+  kubernetesGroups:
+    claim: groups
+    prefix: "oidc:"
+
+# The environments (see the README). Rendered into a ConfigMap from `content`, a map here, or from
+# `text`, the file as it is (--set-file catalog.text=catalog.yaml); or read from your own ConfigMap
+# in the release namespace.
+catalog:
+  existingConfigMap: ""
+  key: catalog.yaml
+  content: {}
+  text: ""
+
+# Where the Jobs run: the namespace of every in-cluster environment in the catalog, usually the
+# one that holds the CloudNativePG Clusters. Each gets a Role for this app, the Jobs' service
+# account and, with networkPolicy.databases, a rule that lets the Jobs reach the databases.
+rbac:
+  namespaces: [database]
+
+jobs:
+  serviceAccountName: databases-ui-job
+  # Namespaces of the workloads a restore in place scales to 0: the Jobs may scale Deployments
+  # and StatefulSets there, nothing else.
+  scaleNamespaces: []
+
+# A ValidatingAdmissionPolicy (Kubernetes 1.30+) that holds the Jobs this app creates to what it
+# builds: its image, one owner's password, the CA certificate, TLS to its own namespace and the
+# catalog's storage. Creating Jobs would otherwise let it mount any Secret in those namespaces.
+jobPolicy:
+  enabled: true
+
+storage:
+  # A SAS token instead of Entra ID, for an emulator such as Azurite or one storage account: a
+  # Secret with this name in the release namespace AND in every namespace of rbac.namespaces.
+  sas:
+    existingSecret: ""
+    key: sas
+
+# Your colours, as quoted "#rrggbb"; empty keeps the default. The accent fills buttons, links, the
+# selected page and the logo; accentText is the text on it. The dark ones default to these two.
+branding:
+  accent: ""
+  accentText: ""
+  accentDark: ""
+  accentTextDark: ""
+
+session:
+  # A Secret holding the key that seals session cookies (at least 32 characters), shared by
+  # every replica. Empty: the chart creates one on install and keeps it on upgrade.
+  existingSecret: ""
+  key: session-key
+
+serviceAccount:
+  create: true
+  # Defaults to the release's full name. It is the subject of the federated credential.
+  name: ""
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # Defaults to the host of config.publicOrigin.
+  host: ""
+  tls:
+    # The TLS Secret for the host; empty for no tls block.
+    secretName: ""
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# One replica per node where possible. DoNotSchedule makes it strict.
+topologySpread:
+  enabled: true
+  whenUnsatisfiable: ScheduleAnyway
+  # Honor keeps tainted nodes out of the count; empty leaves the Kubernetes default.
+  nodeTaintsPolicy: ""
+# Or your own constraints, rendered as they are instead of the one above.
+topologySpreadConstraints: []
+
+networkPolicy:
+  # The server: ingress to the http port from ingressFrom (any pod when empty); egress to DNS
+  # and to public addresses on 443 (Entra ID, Azure Storage). The Kubernetes API and storage on
+  # a private address need extraEgress.
+  enabled: false
+  ingressFrom: []
+  extraEgress: []
+  # In each namespace of rbac.namespaces: let the Jobs' pods reach PostgreSQL (5432) on the
+  # CloudNativePG pods, for clusters whose pods take only listed clients.
+  databases:
+    enabled: false
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+priorityClassName: ""
+podLabels: {}
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+extraEnv: []

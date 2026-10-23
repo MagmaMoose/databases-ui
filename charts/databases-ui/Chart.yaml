@@ -1,0 +1,36 @@
+apiVersion: v2
+name: databases-ui
+description: Let app teams snapshot, restore and clone their own PostgreSQL databases on CloudNativePG, with Entra ID sign-in, Kubernetes Jobs and Azure Blob Storage.
+type: application
+
+# version is the CHART version and appVersion the application version. The release
+# workflow publishes the chart at the release version with appVersion set to the release
+# tag, so these two are only what a local `helm install ./charts/databases-ui` uses.
+# appVersion is the default image tag and keeps the leading "v" the image tags carry.
+version: 0.1.0
+appVersion: "v0.1.0"
+
+home: https://github.com/MagmaMoose/databases-ui
+sources:
+  - https://github.com/MagmaMoose/databases-ui
+keywords:
+  - postgresql
+  - cloudnative-pg
+  - backup
+  - restore
+  - entra-id
+  - workload-identity
+maintainers:
+  - name: Caleb Sargeant
+    url: https://github.com/CalebSargeant
+
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: database
+  artifacthub.io/prerelease: "true"
+  artifacthub.io/links: |
+    - name: Source
+      url: https://github.com/MagmaMoose/databases-ui
+  artifacthub.io/changes: |
+    - kind: added
+      description: First release.

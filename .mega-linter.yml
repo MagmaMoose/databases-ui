@@ -1,0 +1,16 @@
+---
+# Additive to the env Chargate injects (MagmaMoose/chargate, docs/setup.md).
+
+# tests/e2e/fixtures.yaml is the world the end-to-end test builds on a throwaway kind or k3d
+# cluster and deletes with it: Azurite as Microsoft ships it, and RoleBindings that give test
+# groups `edit` and `admin` in app namespaces, because that access is what the test exercises.
+# It is applied nowhere else, so the hardening and RBAC rules these scanners hold manifests to
+# (resource limits, seccomp, a read-only root, trusted registries, no binding to admin) are
+# about deployments it is not. Trivy, Checkov and Semgrep still read every other file, the
+# chart included, and the secret scanners still read this one.
+#
+# Per-linter ARGUMENTS rather than FILTER_REGEX_EXCLUDE: all three are project-scope linters,
+# which MegaLinter's file filter never reaches.
+REPOSITORY_TRIVY_ARGUMENTS: "--skip-files tests/e2e/fixtures.yaml"
+REPOSITORY_CHECKOV_ARGUMENTS: "--skip-path tests/e2e/fixtures.yaml"
+REPOSITORY_SEMGREP_ARGUMENTS: "--exclude tests/e2e/fixtures.yaml"

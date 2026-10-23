@@ -1,0 +1,82 @@
+{{- if .Values.jobPolicy.enabled }}
+{{- $urls := list }}
+{{- range (default list (fromYaml (include "databases-ui.catalogContent" .)).environments) }}
+{{- $urls = append $urls (printf "%q" (trimSuffix "/" .storage.url)) }}
+{{- end }}
+# Creating Jobs in a namespace is, to Kubernetes, reading every Secret there. This keeps the Jobs
+# this app creates to what it builds itself: its own image as `job`, one owner's password (never
+# a superuser's), the server's CA certificate and no other Secret, TLS to a database in the Job's
+# own namespace, and the catalog's storage.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "databases-ui.fullname" . }}-jobs
+  labels:
+    {{- include "databases-ui.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [batch]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [jobs]
+  matchConditions:
+    - name: created-by-databases-ui
+      expression: request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ include "databases-ui.serviceAccountName" . }}"
+  variables:
+    - name: pod
+      expression: object.spec.template.spec
+    - name: env
+      expression: "has(variables.pod.containers[0].env) ? variables.pod.containers[0].env : []"
+  validations:
+    - expression: >-
+        variables.pod.containers.size() == 1 && variables.pod.containers.all(c, c.image == {{ include "databases-ui.image" . | quote }}
+        && !has(c.command) && has(c.args) && c.args == ["job"] && !has(c.envFrom))
+        && !has(variables.pod.initContainers) && !has(variables.pod.ephemeralContainers)
+      message: databases-ui Jobs run only this app's own image, as `job`
+    - expression: >-
+        variables.pod.serviceAccountName == {{ .Values.jobs.serviceAccountName | quote }}
+        && !(has(variables.pod.hostNetwork) && variables.pod.hostNetwork)
+        && !(has(variables.pod.hostPID) && variables.pod.hostPID)
+        && !(has(variables.pod.hostIPC) && variables.pod.hostIPC)
+      message: databases-ui Jobs run as their own service account, in their own network
+    - expression: >-
+        !has(variables.pod.volumes) || variables.pod.volumes.all(v, has(v.emptyDir)
+        || (has(v.projected) && v.projected.sources.all(s, has(s.serviceAccountToken)))
+        || (has(v.secret) && has(v.secret.items) && v.secret.items.all(i, i.key == "ca.crt")))
+      message: databases-ui Jobs mount scratch space, tokens and a CA certificate, nothing else
+    - expression: >-
+        variables.env.all(e, !has(e.valueFrom) || (has(e.valueFrom.secretKeyRef)
+        && ((e.name == "PGPASSWORD" && e.valueFrom.secretKeyRef.key == "password" && !e.valueFrom.secretKeyRef.name.endsWith("-superuser"))
+        {{- with .Values.storage.sas.existingSecret }}
+        || (e.name == "DBUI_STORAGE_SAS" && e.valueFrom.secretKeyRef.name == {{ . | quote }} && e.valueFrom.secretKeyRef.key == {{ $.Values.storage.sas.key | quote }})
+        {{- end }}
+        )))
+      message: databases-ui Jobs read one owner's password from its Secret, never a superuser's
+    - expression: >-
+        variables.env.exists(e, e.name == "PGSSLMODE" && e.value == "verify-full")
+        && variables.env.all(e, e.name != "PGHOST" || (has(e.value) && e.value.matches("^[a-z0-9-]+-rw[.]" + request.namespace + "[.]svc$")))
+      message: databases-ui Jobs connect over verified TLS to a database in their own namespace
+    {{- if $urls }}
+    - expression: >-
+        variables.env.all(e, !(e.name in ["DBUI_BLOB_URL", "DBUI_AUDIT_URL"]) || (has(e.value) && e.value in [{{ join ", " $urls }}]))
+      message: databases-ui Jobs read and write only the catalog's storage
+    {{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "databases-ui.fullname" . }}-jobs
+  labels:
+    {{- include "databases-ui.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "databases-ui.fullname" . }}-jobs
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: {{ toJson .Values.rbac.namespaces }}
+{{- end }}

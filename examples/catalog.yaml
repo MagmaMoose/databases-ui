@@ -1,0 +1,26 @@
+# The catalog of the instance in the dev cluster. Every instance lists every environment; only the
+# one in its own cluster runs Jobs, the others are where shared snapshots come from or go to.
+# Check it with
+#   python -m databases_ui check examples/catalog.yaml
+environments:
+  - name: dev
+    storage:
+      url: https://examplesnapshots.blob.core.windows.net/dev
+    # Snapshots tst and acc share with a namespace here can be cloned into it.
+    cloneFrom: [tst, acc]
+  - name: tst
+    kubernetes: none
+    storage:
+      url: https://examplesnapshots.blob.core.windows.net/tst
+    cloneFrom: [acc]
+  - name: acc
+    kubernetes: none
+    storage:
+      url: https://examplesnapshots.blob.core.windows.net/acc
+  - name: prd
+    kubernetes: none
+    production: true
+    # The Cluster's own name, when it differs from the environment's.
+    cluster: prod
+    storage:
+      url: https://exampleprdsnapshots.blob.core.windows.net/prd

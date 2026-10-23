@@ -1,0 +1,146 @@
+{{- $fullname := include "databases-ui.fullname" . }}
+{{- $labels := include "databases-ui.labels" . }}
+# Who may act on a database is the API server's answer: the server asks it, with a
+# SubjectAccessReview, about the user and groups a person's ID token gives them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-access-review
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-access-review
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-access-review
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "databases-ui.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- range $ns := .Values.rbac.namespaces }}
+---
+# The server reads the Database resources and the Cluster's managed roles, creates and approves
+# Jobs, reads their pods' outcome and keeps one copy database per database. It reads no Secret:
+# the Jobs' pods get the owner's password from the kubelet.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [databases]
+    verbs: [get, list, create, delete]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters]
+    verbs: [get]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, create, patch, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "databases-ui.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+---
+# The Jobs' identity: the subject of their federated credential on the app registration, and of
+# the scale rights below. A Job mounts its Kubernetes token only for a restore in place.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $.Values.jobs.serviceAccountName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+automountServiceAccountToken: false
+{{- if $.Values.networkPolicy.databases.enabled }}
+---
+# The Jobs' pods to PostgreSQL on the CloudNativePG pods, added to whatever else lets clients in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-jobs-to-postgres
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: cnpg.io/cluster
+        operator: Exists
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "databases-ui.name" $ }}
+              app.kubernetes.io/component: job
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}
+{{- end }}
+{{- if .Values.jobs.scaleNamespaces }}
+---
+# A restore in place scales the database's workloads to 0 and back, and waits for their pods.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-scale
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets]
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+{{- range $ns := .Values.jobs.scaleNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-scale
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-scale
+subjects:
+  {{- range $jobs := $.Values.rbac.namespaces }}
+  - kind: ServiceAccount
+    name: {{ $.Values.jobs.serviceAccountName }}
+    namespace: {{ $jobs }}
+  {{- end }}
+{{- end }}
+{{- end }}
