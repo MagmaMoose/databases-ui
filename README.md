@@ -273,7 +273,7 @@ uv run python -m databases_ui check examples/catalog.yaml
 cd frontend && npm install && npm run dev   # the UI on 5173, the API proxied to 8080
 ```
 
-[`e2e/run.py`](e2e/run.py) runs every action against a real cluster with CloudNativePG, Azurite and
+[`tests/e2e/run.py`](tests/e2e/run.py) runs every action against a real cluster with CloudNativePG, Azurite and
 RBAC like an OIDC-backed API server's; CI runs it on kind:
 
 ```bash
@@ -281,7 +281,7 @@ k3d cluster create dbui
 helm install cnpg cloudnative-pg --repo https://cloudnative-pg.github.io/charts --version 0.29.1 \
   --namespace cnpg-system --create-namespace --wait
 docker buildx bake app-local && k3d image import databases-ui:dev -c dbui
-uv run python e2e/run.py
+uv run python tests/e2e/run.py
 ```
 
 ## Licence

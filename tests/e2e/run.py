@@ -4,7 +4,7 @@
     helm install cnpg cloudnative-pg --repo https://cloudnative-pg.github.io/charts \
       --version 0.29.1 --namespace cnpg-system --create-namespace --wait
     docker buildx bake app-local && k3d image import databases-ui:dev -c dbui
-    uv run python e2e/run.py
+    uv run python tests/e2e/run.py
 
 It installs fixtures.yaml and the chart, signs people in by sealing their session cookies with the
 chart's own session key (Entra ID is the one thing not in the loop), and walks every action
@@ -33,7 +33,7 @@ import httpx
 from databases_ui.session import Sealer
 
 HERE = Path(__file__).resolve().parent
-CHART = HERE.parent / "charts" / "databases-ui"
+CHART = HERE.parents[1] / "charts" / "databases-ui"
 ACCOUNT = "e2eaccount"
 ORIGIN = "http://localhost:18080"  # DevSkim: ignore DS162092 - the port-forwarded test server
 # People and their groups, as the API server would name them from an ID token.
@@ -154,7 +154,7 @@ def setup() -> tuple[str, dict[str, str]]:
     sas = account_sas(key)
     with port_forward("storage", "svc/azurite", "10010:10000"):
         for env in ("dev", "tst"):
-            response = httpx.put(f"http://127.0.0.1:10010/{ACCOUNT}/{env}?restype=container&{sas}", headers={"x-ms-version": "2022-11-02"})  # DevSkim: ignore DS137138
+            response = httpx.put(f"http://127.0.0.1:10010/{ACCOUNT}/{env}?restype=container&{sas}", headers={"x-ms-version": "2022-11-02"})  # DevSkim: ignore DS137138,DS162092 - Azurite, port-forwarded to this machine
             assert response.status_code in (201, 409), response.text
     for namespace in ("databases-ui", "database"):
         kubectl("apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "databases-ui-storage", "namespace": namespace}, "stringData": {"sas": sas}}))
@@ -185,7 +185,7 @@ def setup() -> tuple[str, dict[str, str]]:
     cookies = {}
     for person, groups in PEOPLE.items():
         data = {
-            "oid": hashlib.md5(person.encode()).hexdigest(), "upn": f"{person}@example.com", "name": person.title(), "csrf": f"csrf-{person}",  # nosec B324 - an id for a test person
+            "oid": hashlib.sha256(person.encode()).hexdigest()[:32], "upn": f"{person}@example.com", "name": person.title(), "csrf": f"csrf-{person}",
             "user": f"oidc:{person}@example.com", "groups": [f"oidc:{g}" for g in groups],
         }  # fmt: skip
         cookies[person] = sealer.seal("session", data, 3600)

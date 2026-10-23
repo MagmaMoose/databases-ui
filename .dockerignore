@@ -5,7 +5,6 @@
 .coverage
 **/__pycache__
 tests
-e2e
 examples
 charts
 docker-bake.hcl

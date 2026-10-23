@@ -100,7 +100,7 @@ jobs:
       - run: uv run python -m databases_ui check examples/catalog.yaml
 
   # The image, the chart, CloudNativePG, Azurite and real PostgreSQL: every action through the
-  # API, checked in the databases themselves (e2e/run.py).
+  # API, checked in the databases themselves (tests/e2e/run.py).
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -123,7 +123,7 @@ jobs:
           helm install cnpg cloudnative-pg --repo https://cloudnative-pg.github.io/charts --version 0.29.1 \
             --namespace cnpg-system --create-namespace --wait --timeout 5m
       - run: uv sync --locked
-      - run: uv run python e2e/run.py
+      - run: uv run python tests/e2e/run.py
       - name: What the cluster looked like
         if: failure()
         run: |
