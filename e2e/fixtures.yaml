@@ -1,0 +1,193 @@
+# The world the end-to-end test runs in: two CloudNativePG clusters standing in for two
+# environments (dev, and tst as production), an app in each that holds a connection open, Azurite
+# for storage, and NetworkPolicies that let only listed clients reach PostgreSQL.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: database
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: storage
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev-payments
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tst-payments
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: databases-ui
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azurite
+  namespace: storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: azurite}
+  template:
+    metadata:
+      labels: {app: azurite}
+    spec:
+      containers:
+        - name: azurite
+          image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+          command: [azurite-blob, --blobHost, 0.0.0.0, --blobPort, "10000", --skipApiVersionCheck, --disableProductStyleUrl, --location, /data]
+          envFrom:
+            # AZURITE_ACCOUNTS=<account>:<key>, written by run.sh: a key made for this run.
+            - secretRef: {name: azurite-account}
+          ports:
+            - containerPort: 10000
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - {name: data, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: azurite
+  namespace: storage
+spec:
+  selector: {app: azurite}
+  ports:
+    - {port: 10000, targetPort: 10000}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: dev
+  namespace: database
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-system-trixie
+  storage:
+    size: 1Gi
+  managed:
+    roles:
+      - name: payments_dev
+        ensure: present
+        login: true
+        superuser: false
+        passwordSecret: {name: payments-dev-db}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: tst
+  namespace: database
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-system-trixie
+  storage:
+    size: 1Gi
+  managed:
+    roles:
+      - name: payments_tst
+        ensure: present
+        login: true
+        superuser: false
+        passwordSecret: {name: payments-tst-db}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: payments-dev
+  namespace: database
+spec:
+  cluster: {name: dev}
+  name: payments_dev
+  owner: payments_dev
+  ensure: present
+  # Created by the operator, not by the owner: a dump must leave it out to restore as the owner.
+  extensions:
+    - name: citext
+      ensure: present
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: payments-tst
+  namespace: database
+spec:
+  cluster: {name: tst}
+  name: payments_tst
+  owner: payments_tst
+  ensure: present
+  extensions:
+    - name: citext
+      ensure: present
+---
+# The platform's pattern: CloudNativePG pods take only their own cluster, the operator and the
+# apps listed per cluster. The chart's own rule adds the Jobs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cnpg-default-deny
+  namespace: database
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: cnpg.io/cluster, operator: Exists}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cnpg-allow-clients
+  namespace: database
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: cnpg.io/cluster, operator: Exists}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: cnpg.io/cluster, operator: Exists}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: cnpg-system}
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - {key: kubernetes.io/metadata.name, operator: In, values: [dev-payments, tst-payments]}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cnpg-allow-required-egress
+  namespace: database
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: cnpg.io/cluster, operator: Exists}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - {key: cnpg.io/cluster, operator: Exists}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock: {cidr: 0.0.0.0/0}
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 6443}

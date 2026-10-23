@@ -1,0 +1,165 @@
+{{- include "databases-ui.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "databases-ui.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "databases-ui.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "databases-ui.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "databases-ui.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # The catalog is read at startup: a change rolls the pods.
+        checksum/catalog: {{ toYaml .Values.catalog | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "databases-ui.serviceAccountName" . }}
+      # The server reads Database resources and creates Jobs through the Kubernetes API.
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- include "databases-ui.podSecurityContext" . | nindent 8 }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+      {{- else if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.topologySpread.whenUnsatisfiable }}
+          {{- with .Values.topologySpread.nodeTaintsPolicy }}
+          nodeTaintsPolicy: {{ . }}
+          {{- end }}
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              {{- include "databases-ui.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      containers:
+        - name: databases-ui
+          image: {{ include "databases-ui.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "databases-ui.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            {{- include "databases-ui.env" . | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: session
+              mountPath: /etc/databases-ui/session
+              readOnly: true
+            - name: catalog
+              mountPath: /etc/databases-ui/catalog
+              readOnly: true
+            {{- if .Values.storage.sas.existingSecret }}
+            - name: storage
+              mountPath: /etc/databases-ui/storage
+              readOnly: true
+            {{- end }}
+            {{- if .Values.azure.workloadIdentity.enabled }}
+            - name: azure-identity-token
+              mountPath: /var/run/secrets/azure/tokens
+              readOnly: true
+            {{- else }}
+            - name: client-secret
+              mountPath: /etc/databases-ui/client
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: session
+          secret:
+            secretName: {{ include "databases-ui.sessionSecret" . }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.session.key }}
+                path: {{ .Values.session.key }}
+        - name: catalog
+          configMap:
+            name: {{ include "databases-ui.catalogConfigMap" . }}
+            items:
+              - key: {{ .Values.catalog.key }}
+                path: {{ .Values.catalog.key }}
+        {{- with .Values.storage.sas }}
+        {{- if .existingSecret }}
+        - name: storage
+          secret:
+            secretName: {{ .existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .key }}
+                path: {{ .key }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.azure.workloadIdentity.enabled }}
+        # The service-account token Entra ID exchanges through the federated credential. The kubelet
+        # renews it in place before it expires; the app reads the file on every use.
+        - name: azure-identity-token
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: azure-identity-token
+                  audience: {{ .Values.azure.workloadIdentity.audience }}
+                  expirationSeconds: 3600
+        {{- else }}
+        - name: client-secret
+          secret:
+            secretName: {{ .Values.azure.clientSecret.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.azure.clientSecret.key }}
+                path: {{ .Values.azure.clientSecret.key }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

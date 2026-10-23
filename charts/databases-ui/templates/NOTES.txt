@@ -1,0 +1,17 @@
+databases-ui is running as {{ include "databases-ui.fullname" . }} in {{ .Release.Namespace }}.
+
+Open {{ .Values.config.publicOrigin }} and sign in. Register this redirect URI on the app
+registration ({{ .Values.azure.clientId }}):
+
+  {{ .Values.config.publicOrigin }}/auth/callback
+{{- if .Values.azure.workloadIdentity.enabled }}
+
+and federated credentials, audience {{ .Values.azure.workloadIdentity.audience }}, for these subjects:
+
+  system:serviceaccount:{{ .Release.Namespace }}:{{ include "databases-ui.serviceAccountName" . }}
+{{- range .Values.rbac.namespaces }}
+  system:serviceaccount:{{ . }}:{{ $.Values.jobs.serviceAccountName }}
+{{- end }}
+{{- end }}
+
+Jobs run in: {{ join ", " .Values.rbac.namespaces }}.

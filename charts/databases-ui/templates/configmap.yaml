@@ -1,0 +1,12 @@
+{{- if not .Values.catalog.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "databases-ui.catalogConfigMap" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "databases-ui.labels" . | nindent 4 }}
+data:
+  {{ .Values.catalog.key }}: |
+    {{- include "databases-ui.catalogContent" . | nindent 4 }}
+{{- end }}

@@ -1,0 +1,51 @@
+# Everything on, for CI's lint and render.
+azure:
+  tenantId: 11111111-2222-3333-4444-555555555555
+  clientId: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+config:
+  publicOrigin: https://databases.example.com
+catalog:
+  content:
+    environments:
+      - name: dev
+        storage:
+          url: https://examplesnapshots.blob.core.windows.net/dev
+      - name: prd
+        production: true
+        storage:
+          url: https://examplesnapshots.blob.core.windows.net/prd
+    teams:
+      - id: payments
+        name: Payments
+        groups: [6f1c2b7e-3a44-4d0e-9a51-2b8e0c7d9f10]
+        databases:
+          - name: payments
+            workloads:
+              - deployment/{env}-payments/api
+rbac:
+  namespaces: [database]
+jobs:
+  scaleNamespaces: [dev-payments, prd-payments]
+branding:
+  accent: "#0b6e4f"
+  accentText: "#ffffff"
+  accentDark: "#5fd3a8"
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    secretName: databases-ui-tls
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  databases:
+    enabled: true
+priorityClassName: medium
+topologySpread:
+  whenUnsatisfiable: DoNotSchedule
+  nodeTaintsPolicy: Honor

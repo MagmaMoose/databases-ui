@@ -1,0 +1,133 @@
+# Backend tests, the frontend's typecheck and build, the chart's lint and schema checks, the
+# example catalog, and the whole thing end to end on a kind cluster with CloudNativePG.
+#
+# Its own file, not a step in release.yml, security.yml or quality.yml: those are rewritten
+# from org-wide templates by Caldrith provisioning.
+#
+# All actions are SHA-pinned; the trailing comment is the tag each SHA corresponds to.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'LICENSE', '.gitignore']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: '3.12'
+      - run: uv sync --locked
+      - run: uv run pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Typecheck and build
+        working-directory: frontend
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+      # The CSP allows no inline script or style, so the built page must carry none.
+      - name: No inline code in the page
+        run: |
+          set -euo pipefail
+          if grep -qE '<script>|<script [^>]*>[^<]+</script>|<style|style=' frontend/dist/index.html; then
+            echo "frontend/dist/index.html has inline script or style, which the CSP blocks" >&2
+            exit 1
+          fi
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: yokawasa/action-setup-kube-tools@b16d49b2c459d33cf9d4c300a220ef0bcdbc730a # v0.14.0
+        with:
+          setup-tools: kubeconform
+          kubeconform: '0.6.7'
+      - name: helm lint
+        run: helm lint charts/databases-ui --values charts/databases-ui/ci/default-values.yaml
+      # Everything switched on and the smallest working install, against the real API schemas.
+      - name: Render and validate
+        run: |
+          set -euo pipefail
+          for values in charts/databases-ui/ci/default-values.yaml charts/databases-ui/ci/sas-values.yaml; do
+            helm template t charts/databases-ui --namespace databases --values "$values" >rendered.yaml
+            kubeconform -strict -summary -kubernetes-version 1.33.0 -schema-location default rendered.yaml
+          done
+          # Missing required values must fail the render, not install something half-configured.
+          if helm template t charts/databases-ui >/dev/null 2>&1; then
+            echo "the chart rendered without azure.tenantId" >&2
+            exit 1
+          fi
+
+  catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: '3.12'
+      # The example catalog is the README's reference: it has to hold together.
+      - run: uv sync --locked --no-dev
+      - run: uv run python -m databases_ui check examples/catalog.yaml
+
+  # The image, the chart, CloudNativePG, Azurite and real PostgreSQL: every action through the
+  # API, checked in the databases themselves (e2e/run.py).
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: '3.12'
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Build the image
+        run: docker build --tag databases-ui:dev .
+      # kind comes with the runner image.
+      - name: A cluster with CloudNativePG
+        run: |
+          set -euo pipefail
+          kind create cluster --name dbui --wait 120s
+          kind load docker-image databases-ui:dev --name dbui
+          helm install cnpg cloudnative-pg --repo https://cloudnative-pg.github.io/charts --version 0.29.1 \
+            --namespace cnpg-system --create-namespace --wait --timeout 5m
+      - run: uv sync --locked
+      - run: uv run python e2e/run.py
+      - name: What the cluster looked like
+        if: failure()
+        run: |
+          kubectl get pods,jobs -A -o wide
+          kubectl -n database get clusters,databases.postgresql.cnpg.io -o wide
+          kubectl -n databases-ui logs deployment/databases-ui --tail=200
+          for pod in $(kubectl -n database get pods -l app.kubernetes.io/component=job -o name); do kubectl -n database logs "$pod" --tail=50; done

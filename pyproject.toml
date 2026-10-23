@@ -1,0 +1,30 @@
+[project]
+name = "databases-ui"
+# The release version lives in the git tag and reaches the image as APP_VERSION.
+version = "0.0.0"
+description = "Let app teams snapshot, restore and clone their own PostgreSQL databases on CloudNativePG, without platform help"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.140",
+    "uvicorn>=0.50",
+    "httpx>=0.28",
+    "pyjwt[crypto]>=2.10",
+    "cryptography>=45",
+    "pyyaml>=6.0.2",
+]
+
+[project.scripts]
+databases-ui = "databases_ui.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-cov>=6"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.13"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning:databases_ui.*"]
