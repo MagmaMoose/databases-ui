@@ -181,7 +181,7 @@ def setup() -> tuple[str, dict[str, str]]:
                     "args": ["-c", "ssl=on", "-c", "ssl_cert_file=/tls/tls.crt", "-c", "ssl_key_file=/tls/tls.key"],
                     "env": [{"name": "POSTGRES_DB", "value": "ledger"}, {"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "ledger-superuser", "key": "password"}}}],
                     # Over TCP: the image's first-start server listens on its socket only, then restarts.
-                    "readinessProbe": {"exec": {"command": ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "ledger"]}, "periodSeconds": 3},
+                    "readinessProbe": {"exec": {"command": ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "ledger"]}, "periodSeconds": 3},  # DevSkim: ignore DS162092 - the test database checks itself on its own loopback
                     "volumeMounts": [{"name": "tls", "mountPath": "/tls", "readOnly": True}],
                 }], "volumes": [{"name": "tls", "secret": {"secretName": "ledger-tls", "defaultMode": 0o440}}]},
             }},
@@ -459,7 +459,7 @@ def external_and_scripts(alice: Client, bob: Client, pat: Client, carol: Client)
     finished(alice, "dev", job["name"])
     taken = alice.get("/api/environments/dev/databases/ledger/snapshots").json()["snapshots"]
     assert len(taken) == 1 and taken[0]["size"] > 0, taken
-    refused = alice.post("/api/environments/dev/databases/ledger/restore", {"source_environment": "dev", "source_database": "ledger", "snapshot": taken[0]["id"], "into": "database", "reason": "no"})
+    refused = alice.post("/api/environments/dev/databases/ledger/restore", {"source_environment": "dev", "source_database": "ledger", "snapshot": taken[0]["id"], "into": "database", "reason": "roll it back"})
     assert refused.status_code == 409 and refused.json()["error"] == "external", refused.text
     ok("external database: snapshotted over verify-full TLS against its own CA, as its owner; not restored here")
 

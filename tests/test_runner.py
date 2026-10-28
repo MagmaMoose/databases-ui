@@ -184,10 +184,8 @@ SCRIPT = "insert into menu (code) values ('A');\ninsert into menu (code) values 
 
 
 def script_env(tmp_path: Path, mode: str = "check", **extra: str) -> dict[str, str]:
-    return job_env(
-        tmp_path, "script", DBUI_SCRIPT=SCRIPT, DBUI_SCRIPT_MODE=mode, DBUI_SCRIPT_OUTPUT="full", DBUI_SCRIPT_BLOB="scripts/payments_dev/20261023T140000Z-abcdef.sql",
-        DBUI_BLOB="", **extra,
-    )  # fmt: skip
+    defaults = {"DBUI_SCRIPT": SCRIPT, "DBUI_SCRIPT_MODE": mode, "DBUI_SCRIPT_OUTPUT": "full", "DBUI_SCRIPT_BLOB": "scripts/payments_dev/20261023T140000Z-abcdef.sql", "DBUI_BLOB": ""}
+    return job_env(tmp_path, "script", **{**defaults, **extra})
 
 
 def test_a_check_runs_the_script_between_begin_and_rollback(world, tools, tmp_path):

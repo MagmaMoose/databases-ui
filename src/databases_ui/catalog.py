@@ -50,7 +50,7 @@ NAME = r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
 # A database name that is also a valid label value; `_copy` must still fit in PostgreSQL's 63.
 DATABASE = r"^[a-z0-9]([a-z0-9_-]{0,56}[a-z0-9])?$"
 NAMESPACE = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
-SECRET = r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
+OBJECT_NAME = r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
 # A host name or an IPv4 address, as libpq takes it in PGHOST.
 HOST = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
 # A role or database name as PostgreSQL stores it, unquoted or not: no NUL, no control characters.
@@ -129,12 +129,12 @@ class External(_Model):
     port: int = Field(default=5432, ge=1, le=65535)
     database: str = Field(pattern=POSTGRES_NAME)
     user: str = Field(pattern=POSTGRES_NAME)
-    password_secret: str = Field(alias="passwordSecret", pattern=SECRET)
+    password_secret: str = Field(alias="passwordSecret", pattern=OBJECT_NAME)
     # verify-full checks the server's certificate and name: against `ca.crt` in caSecret, or the
     # image's public roots without one. require encrypts without checking; disable, for a server
     # without TLS on a network you trust.
     tls: Literal["verify-full", "require", "disable"] = "verify-full"
-    ca_secret: str = Field(default="", alias="caSecret", pattern=r"^$|" + SECRET)
+    ca_secret: str = Field(default="", alias="caSecret", pattern=r"^$|" + OBJECT_NAME)
 
     @model_validator(mode="after")
     def _ca(self) -> External:
