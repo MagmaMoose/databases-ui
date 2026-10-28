@@ -8,6 +8,17 @@ environments:
       url: https://examplesnapshots.blob.core.windows.net/dev
     # Snapshots tst and acc share with a namespace here can be cloned into it.
     cloneFrom: [tst, acc]
+    # PostgreSQL servers outside CloudNativePG: snapshots and scripts here, restores elsewhere.
+    # The Jobs log in as user, with the password in passwordSecret (key password) in this
+    # environment's namespace: the schema's owner, not a superuser.
+    external:
+      - name: billing
+        namespace: dev-billing
+        host: billing-db.example.internal
+        database: billing
+        user: billing_owner
+        passwordSecret: billing-db
+        caSecret: billing-db-ca
   - name: tst
     kubernetes: none
     storage:

@@ -578,6 +578,11 @@ input[aria-invalid="true"] {
   margin: 4px -20px -18px;
 }
 
+/* A footer beside the body, not inside it, sits at the dialog's edge as it is. */
+.form > .dialog-footer {
+  margin: 0;
+}
+
 .form {
   display: grid;
   gap: 14px;
@@ -860,4 +865,73 @@ tr.muted td {
 .choice > span {
   flex: 1;
   text-align: left;
+}
+
+/* Scripts: the dialog's editor, and what a script said, under Activity. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.file-button {
+  cursor: pointer;
+}
+
+.file-button:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+textarea.script {
+  min-height: 180px;
+  font-size: 13px;
+  line-height: 1.5;
+  tab-size: 4;
+}
+
+.form .check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.form .check input {
+  width: auto;
+  min-height: 0;
+}
+
+.script-details {
+  margin-top: 6px;
+}
+
+.script-details summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.output {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }

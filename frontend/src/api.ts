@@ -18,18 +18,23 @@ export type Me = {
 
 export type Database = {
   name: string;
+  // cloudnativepg: a Database resource. external: a server the catalog names.
+  kind: "cloudnativepg" | "external";
   namespace: string;
   owner: string;
   owner_secret: string;
   ready: boolean;
   message: string;
+  server: { host: string; port: number; database: string; tls: string } | null;
   workloads: string[];
   copy: { name: string; ready: boolean } | null;
   can_snapshot: boolean;
   can_restore: boolean;
+  can_script: boolean;
 };
 
-export type User = { name: string; managed: boolean; login: boolean; secret: string; databases: string[]; namespaces: string[] };
+// `server` is host:port/database for an external database's login, empty for a managed role.
+export type User = { name: string; managed: boolean; login: boolean; secret: string; databases: string[]; namespaces: string[]; server: string };
 
 export type Snapshot = {
   environment: string;
@@ -47,7 +52,7 @@ export type JobState = "waiting" | "starting" | "running" | "succeeded" | "faile
 
 export type Job = {
   name: string;
-  action: "snapshot" | "restore";
+  action: "snapshot" | "restore" | "script";
   database: string;
   namespace: string;
   state: JobState;
@@ -63,16 +68,23 @@ export type Job = {
   into: "" | "database" | "copy";
   target_database: string;
   approval: string;
+  // A script's: check or run, its id, its sha256 and the script itself, as the Job holds it.
+  mode: "" | "check" | "run";
+  script: string;
+  script_sha256: string;
+  script_text: string;
   started: string;
   finished: string;
-  result: { result?: string; bytes?: number; seconds?: number; reason?: string };
+  result: { result?: string; bytes?: number; seconds?: number; reason?: string; mode?: string; output?: string };
   can_approve: boolean;
   can_decline: boolean;
 };
 
-export type AuditEntry = { at: string; environment: string; actor: string; action: string; database?: string; namespace?: string; job?: string; snapshot?: string; target?: string; detail?: string };
+export type AuditEntry = { at: string; environment: string; actor: string; action: string; database?: string; namespace?: string; job?: string; snapshot?: string; script?: string; target?: string; detail?: string };
 
 export type RestoreRequest = { source_environment: string; source_database: string; snapshot: string; into: "database" | "copy"; reason: string };
+
+export type ScriptRequest = { script: string; mode: "check" | "run"; reason: string; snapshot: boolean };
 
 export class ApiError extends Error {
   constructor(
@@ -128,6 +140,7 @@ export const api = {
   snapshots: (e: string, d: string) => request<{ snapshots: Snapshot[] }>("GET", `${db(e, d)}/snapshots`).then((r) => r.snapshots),
   snapshot: (e: string, d: string, note: string) => request<Job>("POST", `${db(e, d)}/snapshots`, { note }),
   restore: (e: string, d: string, body: RestoreRequest) => request<Job>("POST", `${db(e, d)}/restore`, body),
+  script: (e: string, d: string, body: ScriptRequest) => request<Job>("POST", `${db(e, d)}/scripts`, body),
   shared: (e: string, d: string) => request<{ snapshots: Snapshot[] }>("GET", `${db(e, d)}/shared`).then((r) => r.snapshots),
   share: (e: string, d: string, id: string, target: { environment: string; namespace: string }) =>
     request<Snapshot>("POST", `${db(e, d)}/snapshots/${encodeURIComponent(id)}/share`, target),

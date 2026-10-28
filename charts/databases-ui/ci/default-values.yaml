@@ -16,6 +16,21 @@ catalog:
         storage:
           url: https://examplesnapshots.blob.core.windows.net/dev
         cloneFrom: [acc]
+        external:
+          - name: ledger
+            namespace: dev-ledger
+            host: ledger-db.example.internal
+            database: ledger
+            user: ledger_owner
+            passwordSecret: ledger-db
+            caSecret: ledger-db-ca
+          - name: archive
+            host: 10.20.30.40
+            port: 6432
+            database: archive
+            user: archive_owner
+            passwordSecret: archive-db
+            tls: require
       - name: acc
         kubernetes: none
         storage:

@@ -6,7 +6,7 @@ import { Menu } from "../components/Menu";
 import { Loading, message, useLoad } from "../components/ui";
 import { bytes, snapshotTime } from "../format";
 
-type Open = null | { kind: "snapshot" } | { kind: "restore"; snapshot?: string } | { kind: "share"; snapshot: Snapshot } | { kind: "drop" };
+type Open = null | { kind: "snapshot" } | { kind: "script" } | { kind: "restore"; snapshot?: string } | { kind: "share"; snapshot: Snapshot } | { kind: "drop" };
 
 export function DatabaseView({ env, name }: { env: Environment; name: string }) {
   const { notify } = useSession();
@@ -46,19 +46,30 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
       <div className="page-head">
         <h1>{db.name}</h1>
         <p className="muted">
-          {env.name} · namespace <span className="mono">{db.namespace}</span> · owned by <span className="mono">{db.owner}</span>
+          {env.name} · namespace <span className="mono">{db.namespace}</span> · {db.server ? "as" : "owned by"} <span className="mono">{db.owner}</span>
           {db.owner_secret && (
             <>
               {" "}
               (password in Secret <span className="mono">{db.owner_secret}</span>)
             </>
           )}
+          {db.server && (
+            <>
+              {" "}
+              · external, <span className="mono">{`${db.server.host}:${db.server.port}/${db.server.database}`}</span>
+            </>
+          )}
         </p>
-        {(db.can_snapshot || db.can_restore) && (
+        {(db.can_snapshot || db.can_restore || db.can_script) && (
           <div className="actions">
             {db.can_snapshot && (
               <button type="button" className="button" onClick={() => setDialog({ kind: "snapshot" })}>
                 Take a snapshot
+              </button>
+            )}
+            {db.can_script && (
+              <button type="button" className={db.can_restore ? "button" : "button primary"} onClick={() => setDialog({ kind: "script" })}>
+                Run a script…
               </button>
             )}
             {db.can_restore && (
@@ -70,6 +81,11 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
         )}
       </div>
       {!db.ready && <p className="notice warn">CloudNativePG has not applied this database: {db.message || "no reason given"}.</p>}
+      {db.server && (
+        <p className="notice">
+          An external database: snapshots and scripts run here as <span className="mono">{db.owner}</span>. Restoring one of its snapshots happens outside this app.
+        </p>
+      )}
       {db.copy && (
         <p className="notice">
           A copy, <span className="mono">{db.copy.name}</span>, holds a restored snapshot{db.copy.ready ? "" : " (being created)"}.{" "}
@@ -142,6 +158,18 @@ export function DatabaseView({ env, name }: { env: Environment; name: string }) 
           onDone={() => {
             setDialog(null);
             notify(`Taking a snapshot of ${name}; it shows here when it is done.`);
+            go(`/${env.name}/activity`);
+          }}
+        />
+      )}
+      {dialog?.kind === "script" && (
+        <ScriptDialog
+          env={env}
+          db={db}
+          onClose={() => setDialog(null)}
+          onDone={(waiting, mode) => {
+            setDialog(null);
+            notify(waiting ? "The script waits for a second person to approve it." : mode === "check" ? "Checking the script; its output shows under Activity." : "The script is running; its output shows under Activity.");
             go(`/${env.name}/activity`);
           }}
         />
@@ -220,6 +248,119 @@ function SnapshotDialog({ env, db, onClose, onDone }: { env: Environment; db: Da
           </button>
           <button type="submit" className="button primary" disabled={busy}>
             Take the snapshot
+          </button>
+        </footer>
+      </form>
+    </Dialog>
+  );
+}
+
+function ScriptDialog({ env, db, onClose, onDone }: { env: Environment; db: Database; onClose: () => void; onDone: (waiting: boolean, mode: "check" | "run") => void }) {
+  const [script, setScript] = useState("");
+  const [mode, setMode] = useState<"check" | "run">("check");
+  const [snapshot, setSnapshot] = useState(true);
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const ready = script.trim() !== "" && reason.trim().length >= 3;
+
+  async function load(file: File | undefined) {
+    if (!file) return;
+    if (file.size > 100_000) {
+      setError(`${file.name} is over 100 kB; split it.`);
+      return;
+    }
+    setError("");
+    setScript(await file.text());
+  }
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const job = await api.script(env.name, db.name, { script, mode, reason: reason.trim(), snapshot: mode === "run" && snapshot });
+      onDone(job.state === "waiting", mode);
+    } catch (err) {
+      setError(message(err));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog title={`Run a script on ${db.name}`} wide onClose={onClose}>
+      <form className="form" onSubmit={(e) => void submit(e)}>
+        <div className="dialog-body">
+          <div className="field">
+            <div className="label-row">
+              <label htmlFor="script">SQL</label>
+              <label className="button small file-button">
+                Open a .sql file…
+                <input type="file" accept=".sql,text/plain" className="visually-hidden" onChange={(e) => void load(e.target.files?.[0])} />
+              </label>
+            </div>
+            <textarea
+              id="script"
+              className="mono script"
+              data-autofocus=""
+              rows={10}
+              spellCheck={false}
+              value={script}
+              onChange={(e) => setScript(e.target.value)}
+              placeholder={"insert into menu (code, label) values ('A', 'Results');\nupdate menu set position = 10 where code = 'A';"}
+            />
+            <p className="hint">
+              It runs as <span className="mono">{db.owner}</span>, in one transaction: every statement or none. End each statement with a semicolon, and leave out BEGIN, COMMIT and psql
+              commands. A lock it can't get within 15 seconds stops it.
+            </p>
+          </div>
+          <fieldset className="field">
+            <legend>How</legend>
+            <ul className="choices">
+              <li>
+                <label className={mode === "check" ? "choice chosen" : "choice"}>
+                  <input type="radio" name="mode" checked={mode === "check"} onChange={() => setMode("check")} />
+                  <span>
+                    <strong>Check</strong>: run it, show what it did, then roll it back
+                  </span>
+                </label>
+              </li>
+              <li>
+                <label className={mode === "run" ? "choice chosen" : "choice"}>
+                  <input type="radio" name="mode" checked={mode === "run"} onChange={() => setMode("run")} />
+                  <span>
+                    <strong>Run</strong>: commit it
+                  </span>
+                </label>
+              </li>
+            </ul>
+          </fieldset>
+          {mode === "run" && (
+            <label className="check">
+              <input type="checkbox" checked={snapshot} onChange={(e) => setSnapshot(e.target.checked)} />
+              Take a snapshot first, to go back to
+            </label>
+          )}
+          <div className="field">
+            <label htmlFor="script-reason">Why</label>
+            <input id="script-reason" required minLength={3} maxLength={300} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="the menu items for the next release" />
+          </div>
+          <p className="hint">
+            A copy of the script and who ran it are kept in {env.name}'s audit log.
+            {env.production && " In production a second person approves it, after reading it, before it starts; the output shows statement results, not rows."}
+          </p>
+          {error && (
+            <p className="notice error" role="alert">
+              {error}
+            </p>
+          )}
+        </div>
+        <footer className="dialog-footer">
+          <button type="button" className="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className={mode === "run" && !env.production ? "button danger" : "button primary"} disabled={busy || !ready}>
+            {env.production ? "Ask for approval" : mode === "check" ? "Check the script" : "Run the script"}
           </button>
         </footer>
       </form>

@@ -30,7 +30,9 @@ def check(path: Path) -> int:
             print(problem, file=sys.stderr)
         return 1
     here = sorted(e.name for e in catalog.environments.values() if e.runs_jobs)
-    print(f"{len(catalog.environments)} environments, {', '.join(here)} in this cluster: the catalog holds together.")
+    external = sum(len(e.external) for e in catalog.environments.values())
+    servers = f", {external} external database{'s' if external != 1 else ''}" if external else ""
+    print(f"{len(catalog.environments)} environments, {', '.join(here)} in this cluster{servers}: the catalog holds together.")
     return 0
 
 

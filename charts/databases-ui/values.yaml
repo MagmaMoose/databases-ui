@@ -58,7 +58,8 @@ config:
 
 # The environments (see the README). Rendered into a ConfigMap from `content`, a map here, or from
 # `text`, the file as it is (--set-file catalog.text=catalog.yaml); or read from your own ConfigMap
-# in the release namespace.
+# in the release namespace. An environment's `external` databases need content or text: the Jobs'
+# admission policy admits their hosts from the rendered catalog, and refuses them otherwise.
 catalog:
   existingConfigMap: ""
   key: catalog.yaml

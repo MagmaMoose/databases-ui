@@ -7,6 +7,10 @@ restore   in one transaction, everything the owner role owns is dropped and the 
           script, from pg_restore, runs: the database ends up as it was when the snapshot was
           taken, or on any error as it was before. In place, the workloads that use it go to 0
           replicas first and back afterwards; for a copy, it first waits for the database.
+script    someone's SQL, in one transaction that psql opens and, once every statement has
+          succeeded, commits (run) or rolls back (check); on the first error nothing changes. A
+          lock it can't get within LOCK_TIMEOUT fails the script, rather than queueing the app's
+          own queries behind it. Optionally a snapshot first, as above.
 
 Nothing goes through `kubectl exec` or a disk. The outcome goes to the pod's termination
 message, which the server shows, and to the environment's audit log.
@@ -19,15 +23,17 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess  # nosec B404 - runs pg_dump, pg_restore and psql with fixed arguments, no shell
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from . import audit
+from . import audit, sql
 from .blob import BlobError, Container
 from .entra import AppToken, federated_credential
 from .kube import Kube, KubeError
@@ -39,6 +45,17 @@ SCALED = "databases-ui/replicas-before-restore"
 READ = 1024 * 1024
 WAIT_SECONDS = 300
 REACH_SECONDS = 60
+LOCK_TIMEOUT = "15s"
+# What of a script's output reaches the termination message, which Kubernetes caps at 4096 bytes.
+OUTPUT_CHARS = 2400
+OUTPUT_LINES = 200
+# Production output: command tags (UPDATE 3) and psql's messages, never a row.
+_TAG = re.compile(
+    r"^(?:(?:INSERT \d+ \d+|UPDATE \d+|DELETE \d+|SELECT \d+|MERGE \d+|COPY \d+|FETCH \d+|MOVE \d+)"
+    r"|(?:CREATE|ALTER|DROP|COMMENT|GRANT|REVOKE|SET|RESET|DO|CALL|TRUNCATE|LOCK|ANALYZE|VACUUM|REINDEX|CLUSTER|REFRESH|BEGIN|COMMIT|ROLLBACK"
+    r"|SECURITY|IMPORT|NOTIFY|LISTEN|UNLISTEN|DISCARD|PREPARE|EXECUTE|DEALLOCATE)(?: [A-Z ]+)?)$"
+)
+_MESSAGE = re.compile(r"^(?:psql:|ERROR:|WARNING:|NOTICE:|INFO:|DETAIL:|HINT:|CONTEXT:|QUERY:|LINE \d+:|\s+\^)")
 
 
 class JobFailed(Exception):
@@ -228,6 +245,89 @@ async def restore(env: Mapping[str, str], container: Container, kube: Kube | Non
     return {"bytes": size}
 
 
+class ScriptFailed(JobFailed):
+    """A script psql stopped, with what it said."""
+
+    def __init__(self, message: str, outcome: dict[str, Any]):
+        super().__init__(message)
+        self.outcome = outcome
+
+
+def _shown(line: str) -> bool:
+    return bool(_TAG.match(line) or _MESSAGE.match(line))
+
+
+async def apply_script(text: str, *, commit: bool, full: bool) -> tuple[int, str]:
+    """psql's exit status and the tail of what it said, running `text` between BEGIN and COMMIT
+    (or ROLLBACK). ON_ERROR_STOP ends psql at the first error, before either: its connection
+    closes and PostgreSQL rolls everything back. The script's line numbers are psql's own, as
+    `psql:<stdin>:<line>:`."""
+    proc = await asyncio.create_subprocess_exec(
+        "psql", "--no-password", "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
+        "-c", "BEGIN", "-c", f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'", "--file=-", "-c", "COMMIT" if commit else "ROLLBACK",
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )  # fmt: skip
+    if proc.stdin is None or proc.stdout is None:
+        raise JobFailed("psql started without its pipes")
+    to_psql, from_psql = proc.stdin, proc.stdout
+    kept: deque[str] = deque(maxlen=OUTPUT_LINES)
+
+    async def feed() -> None:
+        try:
+            to_psql.write(text.encode())
+            await to_psql.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # psql stopped on an error; its exit status says so
+        finally:
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                to_psql.close()
+
+    async def read() -> None:
+        # In chunks rather than lines: a row can be longer than any line limit.
+        rest = b""
+        while data := await from_psql.read(READ):
+            *lines, rest = (rest + data).split(b"\n")
+            rest = rest[-4096:]
+            for raw in lines:
+                line = raw.decode(errors="replace").rstrip("\r")
+                if full or _shown(line):
+                    kept.append(line[:500])
+        if rest and (full or _shown(rest.decode(errors="replace"))):
+            kept.append(rest.decode(errors="replace")[:500])
+
+    await asyncio.gather(feed(), read())
+    status = await proc.wait()
+    return status, "\n".join(kept)[-OUTPUT_CHARS:]
+
+
+async def script(env: Mapping[str, str], container: Container) -> dict[str, Any]:
+    text, mode = env["DBUI_SCRIPT"], env.get("DBUI_SCRIPT_MODE", "check")
+    # The server checked it too; a Job is only what it was built to be, but this costs nothing.
+    if found := sql.problems(text):
+        raise JobFailed(" ".join(found[:3]))
+    await wait_for_database(REACH_SECONDS)
+    outcome: dict[str, Any] = {"mode": mode}
+    if env.get("DBUI_SNAPSHOT_FIRST"):
+        taken = await snapshot(env, container)
+        outcome["bytes"] = taken["bytes"]
+        _say("snapshot taken before the script", blob=env.get("DBUI_BLOB", ""), bytes=taken["bytes"])
+    status, output = await apply_script(text, commit=mode == "run", full=env.get("DBUI_SCRIPT_OUTPUT") == "full")
+    outcome["output"] = output
+    if status != 0:
+        error = next((line for line in output.splitlines() if "ERROR:" in line), "") or (output.splitlines() or [f"psql exited {status}"])[-1]
+        raise ScriptFailed(f"nothing changed: {error.strip()}"[:600], outcome)
+    return outcome
+
+
+def termination_message(outcome: dict[str, Any]) -> str:
+    """The outcome as JSON within Kubernetes' 4096 bytes: the output's tail gives way first."""
+    message = json.dumps(outcome)
+    while len(message.encode()) > 4000 and outcome.get("output"):
+        outcome["output"] = outcome["output"][len(outcome["output"]) // 4 :]
+        message = json.dumps(outcome)
+    return message[:4000]
+
+
 async def run(env: Mapping[str, str], *, transport: httpx.AsyncBaseTransport | None = None, kube_transport: httpx.AsyncBaseTransport | None = None) -> int:
     action = env.get("DBUI_ACTION", "")
     started = time.monotonic()
@@ -243,23 +343,29 @@ async def run(env: Mapping[str, str], *, transport: httpx.AsyncBaseTransport | N
                 finally:
                     if kube is not None:
                         await kube.aclose()
+            elif action == "script":
+                outcome = {"result": "succeeded", **await script(env, source)}
             else:
                 raise JobFailed(f"unknown action {action!r}")
+        except ScriptFailed as err:
+            outcome = {"result": "failed", "reason": str(err), **err.outcome}
         except (JobFailed, BlobError, KubeError, SignInError, KeyError, ValueError, OSError) as err:
             outcome = {"result": "failed", "reason": str(err)[:1500] or err.__class__.__name__}
         outcome["seconds"] = round(time.monotonic() - started)
+        # A check that went through rolled back: it is recorded as checked, not as a change.
+        ended = "checked" if action == "script" and outcome["result"] == "succeeded" and outcome.get("mode") == "check" else outcome["result"]
         try:
             # The environment's own container, which for a clone is not the snapshot's.
             await audit.record(
-                _container(env, env["DBUI_AUDIT_URL"], http), environment=env.get("DBUI_ENVIRONMENT", ""), actor=env.get("DBUI_REQUESTED_BY", ""), action=f"{action}.{outcome['result']}",
+                _container(env, env["DBUI_AUDIT_URL"], http), environment=env.get("DBUI_ENVIRONMENT", ""), actor=env.get("DBUI_REQUESTED_BY", ""), action=f"{action}.{ended}",
                 database=env.get("DBUI_DATABASE", ""), namespace=env.get("DBUI_NAMESPACE", ""), job=env.get("DBUI_JOB", ""), snapshot=env.get("DBUI_BLOB", ""),
-                detail=outcome.get("reason", ""),
+                script=env.get("DBUI_SCRIPT_BLOB", ""), detail=outcome.get("reason", ""),
             )  # fmt: skip
         except (SignInError, KeyError) as err:
             _say("audit write failed", reason=str(err))
-    _say("finished", action=action, **outcome)
+    _say("finished", action=action, **{k: v for k, v in outcome.items() if k != "output"})
     try:
-        TERMINATION_LOG.write_text(json.dumps(outcome)[:4000])
+        TERMINATION_LOG.write_text(termination_message(outcome))
     except OSError:
         pass  # outside a pod
     return 0 if outcome["result"] == "succeeded" else 1

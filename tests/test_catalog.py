@@ -8,28 +8,35 @@ from databases_ui.__main__ import check
 from databases_ui.catalog import (
     RESTORE,
     RESTORE_PRODUCTION,
+    SCRIPT,
+    SCRIPT_PRODUCTION,
     CatalogError,
     Check,
     load_catalog,
 )
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "catalog.yaml"
+EXT = "  - {name: dev, storage: {url: 'https://a.blob.core.windows.net/dev'}, external: [%s]}\n"
 DEV = "  - {name: dev, storage: {url: 'https://a.blob.core.windows.net/dev'}}\n"
 
 
 def test_the_example_holds_together(capsys):
     assert check(EXAMPLE) == 0
-    assert "4 environments, dev in this cluster" in capsys.readouterr().out
+    assert "4 environments, dev in this cluster, 1 external database" in capsys.readouterr().out
     catalog = load_catalog(EXAMPLE.read_text())
     assert catalog.environments["prd"].cnpg_cluster == "prod" and catalog.environments["dev"].cnpg_cluster == "dev"
     assert [e.name for e in catalog.environments.values() if e.runs_jobs] == ["dev"]
     assert catalog.cloning_from("acc") == ["dev", "tst"] and catalog.cloning_from("prd") == []
+    billing = catalog.environments["dev"].server("billing")
+    assert billing is not None and (billing.host, billing.port, billing.tls, billing.ca_secret) == ("billing-db.example.internal", 5432, "verify-full", "billing-db-ca")
+    assert catalog.environments["dev"].server("nothing") is None
 
 
 def test_access_defaults_and_overrides():
     catalog = load_catalog("environments:\n" + DEV + "  - name: prd\n    production: true\n    storage: {url: 'https://a.blob.core.windows.net/prd'}\n    access:\n      read: {verb: get, resource: deployments/scale, group: apps}\n")
     dev, prd = catalog.environments["dev"], catalog.environments["prd"]
     assert dev.check("restore") == RESTORE and prd.check("restore") == RESTORE_PRODUCTION
+    assert dev.check("script") == SCRIPT and prd.check("script") == SCRIPT_PRODUCTION
     assert prd.check("read") == Check(verb="get", resource="deployments/scale", group="apps")
 
 
@@ -49,6 +56,15 @@ def test_access_defaults_and_overrides():
         ("environments:\n  - {name: dev, kubernetes: none, storage: {url: 'https://a.blob.core.windows.net/x'}}\n", "no environment runs here"),
         ("environments:\n  - {name: dev, storage: {url: 'https://a.blob.core.windows.net/x'}, access: {restore: {verb: 'Get', resource: secrets}}}\n", "verb"),
         ("environments:\n  - {name: dev, storage: {url: 'https://a.blob.core.windows.net/x'}, teams: []}\n", "teams"),
+        ("environments:\n" + EXT % "{name: ledger, host: db.example.internal, database: l, user: u, passwordSecret: s, tls: require, caSecret: ca}", "caSecret is for tls: verify-full"),
+        ("environments:\n" + EXT % "{name: ledger, host: a.example, database: l, user: u, passwordSecret: s}, {name: ledger, host: b.example, database: l, user: u, passwordSecret: s}", "external database 'ledger' twice"),
+        ("environments:\n" + DEV + "  - {name: acc, kubernetes: none, storage: {url: 'https://a.blob.core.windows.net/acc'}, external: [{name: l, host: a.example, database: l, user: u, passwordSecret: s}]}\n", "no Job here reaches"),
+        ("environments:\n" + EXT % "{name: ledger, host: 'db.example.internal:5432', database: l, user: u, passwordSecret: s}", "host"),
+        ("environments:\n" + EXT % "{name: ledger, host: DB.example.internal, database: l, user: u, passwordSecret: s}", "host"),
+        ("environments:\n" + EXT % "{name: ledger, host: db.example.internal, port: 70000, database: l, user: u, passwordSecret: s}", "port"),
+        ("environments:\n" + EXT % "{name: ledger, host: db.example.internal, database: l, user: u, passwordSecret: Bad_Secret}", "passwordSecret"),
+        ("environments:\n" + EXT % "{name: ledger, host: db.example.internal, database: l, user: u}", "passwordSecret"),
+        ("environments:\n" + EXT % "{name: ledger, host: db.example.internal, database: l, user: u, passwordSecret: s, tls: allow}", "tls"),
     ],
 )
 def test_problems_are_named(text, problem):

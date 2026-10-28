@@ -1,12 +1,18 @@
 {{- if .Values.jobPolicy.enabled }}
 {{- $urls := list }}
+{{- $servers := list }}
 {{- range (default list (fromYaml (include "databases-ui.catalogContent" .)).environments) }}
 {{- $urls = append $urls (printf "%q" (trimSuffix "/" .storage.url)) }}
+{{- range (default list .external) }}
+{{- $servers = append $servers . }}
+{{- end }}
 {{- end }}
 # Creating Jobs in a namespace is, to Kubernetes, reading every Secret there. This keeps the Jobs
 # this app creates to what it builds itself: its own image as `job`, one owner's password (never
 # a superuser's), the server's CA certificate and no other Secret, TLS to a database in the Job's
-# own namespace, and the catalog's storage.
+# own namespace or an external database exactly as the catalog has it (host, port, TLS and its
+# own password Secret), and the catalog's storage. External databases are known here only when
+# the catalog is in the values (catalog.content or catalog.text), not catalog.existingConfigMap.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -55,9 +61,16 @@ spec:
         )))
       message: databases-ui Jobs read one owner's password from its Secret, never a superuser's
     - expression: >-
-        variables.env.exists(e, e.name == "PGSSLMODE" && e.value == "verify-full")
-        && variables.env.all(e, e.name != "PGHOST" || (has(e.value) && e.value.matches("^[a-z0-9-]+-rw[.]" + request.namespace + "[.]svc$")))
-      message: databases-ui Jobs connect over verified TLS to a database in their own namespace
+        variables.env.filter(e, e.name == "PGHOST").size() == 1 && variables.env.exists(e, e.name == "PGHOST" && has(e.value) && (
+        (e.value.matches("^[a-z0-9-]+-rw[.]" + request.namespace + "[.]svc$") && variables.env.exists(m, m.name == "PGSSLMODE" && m.value == "verify-full"))
+        {{- range $servers }}
+        || (e.value == {{ .host | quote }}
+        && variables.env.exists(m, m.name == "PGSSLMODE" && m.value == {{ default "verify-full" .tls | quote }})
+        && variables.env.exists(m, m.name == "PGPORT" && m.value == {{ default 5432 .port | toString | quote }})
+        && variables.env.exists(m, m.name == "PGPASSWORD" && has(m.valueFrom) && has(m.valueFrom.secretKeyRef) && m.valueFrom.secretKeyRef.name == {{ .passwordSecret | quote }}))
+        {{- end }}
+        ))
+      message: databases-ui Jobs connect over verified TLS to a database in their own namespace, or to an external database exactly as the catalog has it
     {{- if $urls }}
     - expression: >-
         variables.env.all(e, !(e.name in ["DBUI_BLOB_URL", "DBUI_AUDIT_URL"]) || (has(e.value) && e.value in [{{ join ", " $urls }}]))

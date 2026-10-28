@@ -28,6 +28,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import sql
 from .blob import BlobError, Container
 from .catalog import DATABASE
 from .config import Branding, Config
@@ -91,7 +92,7 @@ def favicon_svg(brand: Branding) -> str:
 
 EnvName = Annotated[str, Path(pattern=r"^[a-z0-9-]{1,32}$")]
 DbName = Annotated[str, Path(pattern=DATABASE)]
-JobName = Annotated[str, Path(pattern=r"^dbui-(snapshot|restore)-[0-9a-f]{8}$")]
+JobName = Annotated[str, Path(pattern=r"^dbui-(snapshot|restore|script)-[0-9a-f]{8}$")]
 SnapshotId = Annotated[str, Path(pattern=SNAPSHOT_ID)]
 
 
@@ -105,6 +106,16 @@ class Restore(BaseModel):
     snapshot: str = Field(pattern=SNAPSHOT_ID)
     into: Literal["database", "copy"]
     reason: str = Field(min_length=3, max_length=300)
+
+
+class Script(BaseModel):
+    # sql.MAX_BYTES is the real limit, in bytes; this keeps an absurd body out before it is read.
+    script: str = Field(min_length=1, max_length=sql.MAX_BYTES)
+    # check: run it and roll back. run: commit it.
+    mode: Literal["check", "run"]
+    reason: str = Field(min_length=3, max_length=300)
+    # Before a run, take a snapshot to go back to.
+    snapshot: bool = True
 
 
 class Share(BaseModel):
@@ -334,6 +345,10 @@ def create_app(cfg: Config, transport: httpx.AsyncBaseTransport | None = None, *
         return await console.restore(
             actor(data), env, db, source_environment=body.source_environment, source_database=body.source_database, snapshot=body.snapshot, into=body.into, reason=body.reason.strip(),
         )  # fmt: skip
+
+    @app.post("/api/environments/{env}/databases/{db}/scripts", status_code=201)
+    async def run_script(env: EnvName, db: DbName, body: Script, data: Writable) -> dict[str, Any]:
+        return await console.run_script(actor(data), env, db, script=body.script, mode=body.mode, reason=body.reason.strip(), snapshot_first=body.snapshot)
 
     @app.delete("/api/environments/{env}/databases/{db}/copy", status_code=204)
     async def drop_copy(env: EnvName, db: DbName, data: Writable) -> Response:

@@ -10,12 +10,15 @@ It installs fixtures.yaml and the chart, signs people in by sealing their sessio
 chart's own session key (Entra ID is the one thing not in the loop), and walks every action
 through the API: snapshots, a restore in place with the app scaled down, a restore into a copy, a
 clone across environments, a production restore and its second person, a decline, a download,
-the audit log and who may do what. Each step checks the database itself, not just the answers.
+an external PostgreSQL (not CloudNativePG) with its own CA, scripts checked, run, failing and
+waiting on a lock, a production script and its second person, the audit log and who may do what.
+Each step checks the database itself, not just the answers.
 """
 
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -24,11 +27,16 @@ import subprocess  # nosec B404 - drives kubectl and helm for a test
 import sys
 import time
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from databases_ui.session import Sealer
 
@@ -65,6 +73,39 @@ def ok(what: str) -> None:
 
 def psql(cluster: str, database: str, sql: str) -> str:
     return kubectl("exec", "-n", "database", f"{cluster}-1", "-c", "postgres", "--", "psql", "-v", "ON_ERROR_STOP=1", "-Atq", "-d", database, "-c", sql).strip()
+
+
+# An external database: plain PostgreSQL in its own namespace, with TLS from a CA of its own.
+LEDGER_HOST = "ledger.legacy.svc"
+LEDGER_IMAGE = "postgres:17-alpine"
+
+
+def ledger_sql(sql: str) -> str:
+    return kubectl("exec", "-n", "legacy", "deploy/ledger", "--", "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-Atq", "-d", "ledger", "-c", sql).strip()
+
+
+def ledger_tls() -> tuple[str, str, str]:
+    """A CA and a server certificate for LEDGER_HOST, signed by it: (ca.crt, tls.crt, tls.key)."""
+    now = datetime.datetime.now(datetime.UTC)
+
+    def pem(cert: x509.Certificate) -> str:
+        return cert.public_bytes(serialization.Encoding.PEM).decode()
+
+    ca_key, key = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "e2e ledger CA")])
+    ca = (
+        x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name).public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True).sign(ca_key, hashes.SHA256())
+    )  # fmt: skip
+    server = (
+        x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, LEDGER_HOST)])).issuer_name(ca_name)
+        .public_key(key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(LEDGER_HOST)]), critical=False).sign(ca_key, hashes.SHA256())
+    )  # fmt: skip
+    private = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+    return pem(ca), pem(server), private
 
 
 def wait_for(what: str, test, timeout: float = 300, every: float = 3) -> Any:
@@ -106,7 +147,7 @@ def apply(*objects: dict[str, Any]) -> None:
 
 def setup() -> tuple[str, dict[str, str]]:
     print("fixtures", flush=True)
-    apply(*({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": n}} for n in ("database", "storage", "dev-payments", "tst-payments", "databases-ui")))
+    apply(*({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": n}} for n in ("database", "storage", "dev-payments", "tst-payments", "databases-ui", "legacy")))
     # Leftovers of an earlier run.
     kubectl("delete", "jobs", "-n", "database", "-l", "app.kubernetes.io/managed-by=databases-ui", "--ignore-not-found", check=False)
     kubectl("delete", "databases.postgresql.cnpg.io", "-n", "database", "-l", "databases-ui/copy-of", "--ignore-not-found", check=False)
@@ -121,6 +162,32 @@ def setup() -> tuple[str, dict[str, str]]:
             {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "payments-db", "namespace": f"{env}-payments"}, "stringData": {"password": password}},
         )
     kubectl("apply", "-f", str(HERE / "fixtures.yaml"))
+    # The external database: its CA certificate for the Jobs, its owner's password, and the server.
+    ca, crt, private = ledger_tls()
+    ledger_password = secrets.token_urlsafe(24)
+    apply(
+        {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "ledger-tls", "namespace": "legacy"}, "stringData": {"tls.crt": crt, "tls.key": private}},
+        {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "ledger-superuser", "namespace": "legacy"}, "stringData": {"password": secrets.token_urlsafe(24)}},
+        {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "ledger-db-ca", "namespace": "database"}, "stringData": {"ca.crt": ca}},
+        {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "ledger-db", "namespace": "database"}, "stringData": {"password": ledger_password}},
+        {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "ledger", "namespace": "legacy"}, "spec": {"selector": {"app": "ledger"}, "ports": [{"port": 5432, "targetPort": 5432}]}},
+        {
+            "apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "ledger", "namespace": "legacy"},
+            "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "ledger"}}, "strategy": {"type": "Recreate"}, "template": {
+                "metadata": {"labels": {"app": "ledger"}},
+                # The image's postgres user is 70: the key is readable through the group, as PostgreSQL allows for a root-owned key.
+                "spec": {"securityContext": {"fsGroup": 70}, "containers": [{
+                    "name": "postgres", "image": LEDGER_IMAGE,
+                    "args": ["-c", "ssl=on", "-c", "ssl_cert_file=/tls/tls.crt", "-c", "ssl_key_file=/tls/tls.key"],
+                    "env": [{"name": "POSTGRES_DB", "value": "ledger"}, {"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "ledger-superuser", "key": "password"}}}],
+                    # Over TCP: the image's first-start server listens on its socket only, then restarts.
+                    "readinessProbe": {"exec": {"command": ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "ledger"]}, "periodSeconds": 3},
+                    "volumeMounts": [{"name": "tls", "mountPath": "/tls", "readOnly": True}],
+                }], "volumes": [{"name": "tls", "secret": {"secretName": "ledger-tls", "defaultMode": 0o440}}]},
+            }},
+        },
+    )  # fmt: skip
+    kubectl("rollout", "restart", "deployment/ledger", "-n", "legacy")
     # A new key each run: Azurite starts empty with it.
     kubectl("rollout", "restart", "deployment/azurite", "-n", "storage")
     for env in ("dev", "tst"):
@@ -151,6 +218,18 @@ def setup() -> tuple[str, dict[str, str]]:
             insert into orders values (1, '{env}-Ada', 12.50), (2, '{env}-Grace', 99.00), (3, '{env}-Katherine', 7.25);
         """)  # fmt: skip
     kubectl("rollout", "status", "deployment/azurite", "-n", "storage", "--timeout=180s")
+    kubectl("rollout", "status", "deployment/ledger", "-n", "legacy", "--timeout=300s")
+    wait_for("the ledger server", lambda: ledger_sql("select 1") == "1", timeout=120, every=2)
+    # The schema's owner, not a superuser: what the catalog gives the Jobs.
+    ledger_sql(f"""
+        drop schema if exists ledger cascade;
+        do $$ begin if not exists (select from pg_roles where rolname = 'ledger_owner') then create role ledger_owner login; end if; end $$;
+        alter role ledger_owner password '{ledger_password}';
+        create schema ledger authorization ledger_owner;
+        set role ledger_owner;
+        create table ledger.entries (id int primary key, label text not null);
+        insert into ledger.entries values (1, 'opening');
+    """)  # fmt: skip
     sas = account_sas(key)
     with port_forward("storage", "svc/azurite", "10010:10000"):
         for env in ("dev", "tst"):
@@ -172,7 +251,13 @@ def setup() -> tuple[str, dict[str, str]]:
         "networkPolicy": {"databases": {"enabled": True}},
         "catalog": {"content": {
             "environments": [
-                {"name": "dev", "storage": {"url": f"http://azurite.storage.svc:10000/{ACCOUNT}/dev"}, "cloneFrom": ["tst"]},  # DevSkim: ignore DS137138
+                {
+                    "name": "dev", "storage": {"url": f"http://azurite.storage.svc:10000/{ACCOUNT}/dev"}, "cloneFrom": ["tst"],  # DevSkim: ignore DS137138
+                    "external": [{
+                        "name": "ledger", "namespace": "dev-payments", "host": LEDGER_HOST, "database": "ledger", "user": "ledger_owner",
+                        "passwordSecret": "ledger-db", "caSecret": "ledger-db-ca",
+                    }],
+                },
                 {"name": "tst", "production": True, "storage": {"url": f"http://azurite.storage.svc:10000/{ACCOUNT}/tst"}, "cloneFrom": ["dev"]},  # DevSkim: ignore DS137138
             ],
         }},
@@ -208,12 +293,16 @@ class Client:
         return self.http.delete(path, headers=self.headers)
 
 
-def finished(c: Client, env: str, job: str) -> dict[str, Any]:
+def ended(c: Client, env: str, job: str) -> dict[str, Any]:
     def done():
         found = next((j for j in c.get(f"/api/environments/{env}/jobs").json()["jobs"] if j["name"] == job), None)
         return found if found and found["state"] in ("succeeded", "failed") else None
 
-    found = wait_for(f"job {job}", done, timeout=300)
+    return wait_for(f"job {job}", done, timeout=300)
+
+
+def finished(c: Client, env: str, job: str) -> dict[str, Any]:
+    found = ended(c, env, job)
     if found["state"] != "succeeded":
         raise SystemExit(f"{job} failed: {found['result']}")
     return found
@@ -234,13 +323,13 @@ def scenarios(cookies: dict[str, str]) -> None:
     me = alice.get("/api/me").json()
     assert me["kubernetes"]["user"] == "oidc:alice@example.com" and [e["name"] for e in me["environments"]] == ["dev", "tst"], me
     dev = alice.get("/api/environments/dev/databases").json()["databases"]
-    assert [(d["name"], d["namespace"], d["can_snapshot"], d["can_restore"]) for d in dev] == [("payments_dev", "dev-payments", True, True)], dev
+    assert [(d["name"], d["namespace"], d["can_snapshot"], d["can_restore"]) for d in dev] == [("ledger", "dev-payments", True, False), ("payments_dev", "dev-payments", True, True)], dev
     assert carol.get("/api/environments/dev/databases").json()["databases"] == []
-    assert [(d["name"], d["can_snapshot"]) for d in audrey.get("/api/environments/dev/databases").json()["databases"]] == [("payments_dev", False)]
+    assert [(d["name"], d["can_snapshot"]) for d in audrey.get("/api/environments/dev/databases").json()["databases"]] == [("ledger", False), ("payments_dev", False)]
     assert [(d["name"], d["can_snapshot"], d["can_restore"]) for d in pat.get("/api/environments/tst/databases").json()["databases"]] == [("payments_tst", True, False)]
     ok("databases: edit in the namespace acts, edit elsewhere sees nothing, cluster view only reads, production restore takes admin")
     users = alice.get("/api/environments/dev/users").json()["users"]
-    assert [(u["name"], u["secret"]) for u in users] == [("payments_dev", "payments-dev-db")], users
+    assert [(u["name"], u["secret"]) for u in users] == [("payments_dev", "payments-dev-db"), ("ledger_owner", "ledger-db")], users
     assert carol.get("/api/environments/dev/users").json()["users"] == []
     ok("users: the owner role and its password Secret, only for databases you see")
     assert carol.post("/api/environments/dev/databases/payments_dev/snapshots").status_code == 404
@@ -285,7 +374,7 @@ def scenarios(cookies: dict[str, str]) -> None:
     assert orders("dev", "payments_dev_copy") == ["dev-Ada", "dev-Grace", "dev-Katherine"]
     assert orders("dev", "payments_dev") == ["dev-Ada", "dev-Grace"]
     assert psql("dev", "payments_dev_copy", "select extname from pg_extension where extname = 'citext'") == "citext"
-    db = alice.get("/api/environments/dev/databases").json()["databases"][0]
+    db = next(d for d in alice.get("/api/environments/dev/databases").json()["databases"] if d["name"] == "payments_dev")
     assert db["copy"]["name"] == "payments_dev_copy", db
     ok("restore into a copy: payments_dev_copy holds the snapshot with its extension, payments_dev untouched")
 
@@ -342,15 +431,89 @@ def scenarios(cookies: dict[str, str]) -> None:
     wait_for("the copy to go", lambda: psql("dev", "postgres", "select count(*) from pg_database where datname = 'payments_dev_copy'") == "0", timeout=120)
     ok("dropped the copy: CloudNativePG dropped payments_dev_copy")
 
+    external_and_scripts(alice, bob, pat, carol)
+
     print("audit log", flush=True)
     dev_log = [(e["action"], e["actor"]) for e in alice.get("/api/environments/dev/audit").json()["entries"]]
     tst_log = [(e["action"], e["actor"]) for e in bob.get("/api/environments/tst/audit").json()["entries"]]
-    for entry in [("snapshot.requested", "alice@example.com"), ("snapshot.succeeded", "alice@example.com"), ("restore.requested", "alice@example.com"), ("restore.succeeded", "alice@example.com"), ("snapshot.downloaded", "alice@example.com"), ("copy.dropped", "alice@example.com")]:
+    for entry in [
+        ("snapshot.requested", "alice@example.com"), ("snapshot.succeeded", "alice@example.com"), ("restore.requested", "alice@example.com"), ("restore.succeeded", "alice@example.com"),
+        ("snapshot.downloaded", "alice@example.com"), ("copy.dropped", "alice@example.com"), ("script.requested", "alice@example.com"), ("script.checked", "alice@example.com"),
+        ("script.succeeded", "alice@example.com"), ("script.failed", "alice@example.com"),
+    ]:  # fmt: skip
         assert entry in dev_log, (entry, dev_log)
-    for entry in [("snapshot.shared", "alice@example.com"), ("restore.approved", "bob@example.com"), ("restore.declined", "bob@example.com"), ("restore.succeeded", "alice@example.com")]:
+    for entry in [
+        ("snapshot.shared", "alice@example.com"), ("restore.approved", "bob@example.com"), ("restore.declined", "bob@example.com"), ("restore.succeeded", "alice@example.com"),
+        ("script.approved", "bob@example.com"), ("script.succeeded", "alice@example.com"),
+    ]:  # fmt: skip
         assert entry in tst_log, (entry, tst_log)
     assert carol.get("/api/environments/dev/audit").json()["entries"] == []
     ok(f"audit log: {len(dev_log)} entries in dev, {len(tst_log)} in tst, who and what; none shown outside the namespace")
+
+
+def external_and_scripts(alice: Client, bob: Client, pat: Client, carol: Client) -> None:
+    print("an external database: plain PostgreSQL, its own CA, its owner's login", flush=True)
+    ledger = next(d for d in alice.get("/api/environments/dev/databases").json()["databases"] if d["name"] == "ledger")
+    assert ledger["kind"] == "external" and ledger["server"]["host"] == LEDGER_HOST and ledger["can_script"] and not ledger["can_restore"], ledger
+    job = alice.post("/api/environments/dev/databases/ledger/snapshots", {"note": "external"}).json()
+    finished(alice, "dev", job["name"])
+    taken = alice.get("/api/environments/dev/databases/ledger/snapshots").json()["snapshots"]
+    assert len(taken) == 1 and taken[0]["size"] > 0, taken
+    refused = alice.post("/api/environments/dev/databases/ledger/restore", {"source_environment": "dev", "source_database": "ledger", "snapshot": taken[0]["id"], "into": "database", "reason": "no"})
+    assert refused.status_code == 409 and refused.json()["error"] == "external", refused.text
+    ok("external database: snapshotted over verify-full TLS against its own CA, as its owner; not restored here")
+
+    print("scripts", flush=True)
+    path = "/api/environments/dev/databases/ledger/scripts"
+    refused = alice.post(path, {"script": "begin;\ninsert into ledger.entries values (9, 'x');\ncommit;", "mode": "check", "reason": "try it"})
+    assert refused.status_code == 422 and "Line 1: BEGIN" in refused.json()["message"], refused.text
+    assert carol.post(path, {"script": "select 1;", "mode": "check", "reason": "not mine"}).status_code == 404
+    ok("refused before any Job: a script with its own transaction, and one on a database you can't see")
+    job = alice.post(path, {"script": "insert into ledger.entries values (2, 'checked');\nselect label from ledger.entries order by id;", "mode": "check", "reason": "see what it does"}).json()
+    out = finished(alice, "dev", job["name"])["result"]["output"]
+    assert "INSERT 0 1" in out and "checked" in out and out.rstrip().endswith("ROLLBACK"), out
+    assert ledger_sql("select count(*) from ledger.entries") == "1"
+    ok("check: it ran, showed its rows, and rolled back")
+    job = alice.post(path, {"script": "insert into ledger.entries values (2, 'second');\nupdate ledger.entries set label = upper(label);", "mode": "run", "reason": "next release", "snapshot": True}).json()
+    done = finished(alice, "dev", job["name"])
+    assert done["result"]["output"].rstrip().endswith("COMMIT") and done["result"]["bytes"] > 0, done["result"]
+    assert ledger_sql("select string_agg(label, ',' order by id) from ledger.entries") == "OPENING,SECOND"
+    assert job["script"] in [s["id"] for s in alice.get("/api/environments/dev/databases/ledger/snapshots").json()["snapshots"]]
+    ok("run: a snapshot first, then committed")
+    job = alice.post(path, {"script": "insert into ledger.entries values (3, 'third');\ninsert into ledger.nothing values (1);", "mode": "run", "reason": "will fail", "snapshot": False}).json()
+    done = ended(alice, "dev", job["name"])
+    assert done["state"] == "failed" and "psql:<stdin>:2: ERROR:" in done["result"]["reason"] and "does not exist" in done["result"]["reason"], done["result"]
+    assert ledger_sql("select count(*) from ledger.entries where id = 3") == "0"
+    ok("a failing statement: nothing changed, and its line is named")
+    holder = subprocess.Popen(  # nosec B603 B607 - a fixed test command
+        ["kubectl", "exec", "-n", "legacy", "deploy/ledger", "--", "psql", "-U", "postgres", "-d", "ledger", "-c", "begin; lock table ledger.entries; select pg_sleep(90); commit;"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )  # fmt: skip
+    try:
+        locked = "select count(*) from pg_locks l join pg_class c on c.oid = l.relation where c.relname = 'entries' and l.mode = 'AccessExclusiveLock' and l.granted"
+        wait_for("the lock", lambda: ledger_sql(locked) == "1", timeout=60, every=1)
+        job = alice.post(path, {"script": "alter table ledger.entries add column note text;", "mode": "run", "reason": "while locked", "snapshot": False}).json()
+        done = ended(alice, "dev", job["name"])
+    finally:
+        ledger_sql("select count(pg_terminate_backend(pid)) from pg_stat_activity where query like '%pg_sleep(90)%' and pid <> pg_backend_pid()")
+        holder.terminate()
+        holder.wait()
+    assert done["state"] == "failed" and "lock timeout" in done["result"]["reason"], done["result"]
+    assert ledger_sql("select count(*) from information_schema.columns where table_name = 'entries' and column_name = 'note'") == "0"
+    ok("a lock it can't get within 15 seconds fails the script, rather than queueing the app's queries behind it")
+
+    print("a production script waits for a second person with admin", flush=True)
+    body = {"script": "update orders set total = total + 1 where id = 1;\nselect customer from orders order by id;", "mode": "run", "reason": "fix the first total", "snapshot": True}
+    assert pat.post("/api/environments/tst/databases/payments_tst/scripts", body).status_code == 403
+    job = alice.post("/api/environments/tst/databases/payments_tst/scripts", body).json()
+    assert job["state"] == "waiting" and job["approval"] == "required" and job["script_text"] == body["script"], job
+    assert alice.post(f"/api/environments/tst/jobs/{job['name']}/approve").status_code == 403
+    before = Decimal(psql("tst", "payments_tst", "select total from orders where id = 1"))
+    assert bob.post(f"/api/environments/tst/jobs/{job['name']}/approve").json()["approved_by"] == "bob@example.com"
+    out = finished(bob, "tst", job["name"])["result"]["output"]
+    assert "UPDATE 1" in out and out.rstrip().endswith("COMMIT") and "tst-Ada" not in out, out
+    assert Decimal(psql("tst", "payments_tst", "select total from orders where id = 1")) == before + 1
+    ok("production script: waited, bob approved, it committed; its output named the statements and showed no rows")
 
 
 def forged(base: dict[str, Any], change) -> str:
@@ -395,6 +558,17 @@ def policy() -> None:
         answer = forged(base, change)
         assert said in answer, (what, answer)
     ok("admission policy: a Job as built passes; with a superuser's password, another image or command, the CA key, other storage, another host or no TLS checks it is refused")
+    name = kubectl("get", "jobs", "-n", "database", "-l", "databases-ui/action=script,databases-ui/database=ledger", "-o", "jsonpath={.items[0].metadata.name}")
+    base = json.loads(kubectl("get", "job", name, "-n", "database", "-o", "json"))
+    assert forged(base, lambda pod: None) == "created"
+    for what, change in [
+        ("no TLS", env("PGSSLMODE", {"value": "disable"})),
+        ("another port", env("PGPORT", {"value": "6432"})),
+        ("another database's password", env("PGPASSWORD", {"valueFrom": {"secretKeyRef": {"name": "payments-dev-db", "key": "password"}}})),
+    ]:
+        answer = forged(base, change)
+        assert "exactly as the catalog has it" in answer, (what, answer)
+    ok("admission policy, external: a script Job as built passes; with TLS off, another port or another database's password it is refused")
     for verb, resource in (("get", "secrets"), ("create", "pods"), ("delete", "clusters.postgresql.cnpg.io")):
         assert kubectl("auth", "can-i", verb, resource, "-n", "database", "--as=system:serviceaccount:databases-ui:databases-ui", check=False).strip() == "no"
     assert kubectl("auth", "can-i", "create", "subjectaccessreviews.authorization.k8s.io", "--as=system:serviceaccount:databases-ui:databases-ui", check=False).strip() == "yes"
