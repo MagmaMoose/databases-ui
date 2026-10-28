@@ -1,14 +1,16 @@
 # databases-ui
 
 Let app teams snapshot, restore and clone their own PostgreSQL databases on
-[CloudNativePG](https://cloudnative-pg.io/), without asking the platform team. People sign in with
-Entra ID and see the databases of the namespaces Kubernetes lets them into; every action runs as a
-Kubernetes Job next to the database.
+[CloudNativePG](https://cloudnative-pg.io/), and run their migration scripts on them or on any other
+PostgreSQL, without asking the platform team. People sign in with Entra ID and see the databases of
+the namespaces Kubernetes lets them into; every action runs as a Kubernetes Job next to the
+database.
 
-- **Access is Kubernetes RBAC.** A `Database` resource names its app's namespace in a label. Who
-  may see it, snapshot it or restore it is what the API server says that person may do in that
-  namespace, asked with a SubjectAccessReview: `view` sees, `edit` snapshots and restores, `admin`
-  restores production. There is no second list of who may do what.
+- **Access is Kubernetes RBAC.** A `Database` resource names its app's namespace in a label (an
+  external database, in the catalog). Who may see it, snapshot it, restore it or run a script on it
+  is what the API server says that person may do in that namespace, asked with a
+  SubjectAccessReview: `view` sees, `edit` snapshots, restores and runs scripts, `admin` restores
+  and runs scripts in production. There is no second list of who may do what.
 - **Snapshots on demand.** `pg_dump` in the custom format, streamed straight into Azure Blob
   Storage with who took it and why. Nothing touches a disk, and nothing leaves the cluster.
 - **Restore in place or into a copy, exactly.** In one transaction, everything the database's owner
@@ -18,8 +20,14 @@ Kubernetes Job next to the database.
   by CloudNativePG.
 - **Clone across environments, once shared.** Someone who may snapshot a database in acc shares a
   snapshot with a namespace in dev; whoever may restore there can then clone it.
-- **Production is careful.** A restore in a production environment waits for a second person, and
-  snapshots taken there can't be downloaded.
+- **Scripts, checked or run.** Paste or open a `.sql` file: it runs as the database's owner in one
+  transaction. A check runs it, shows what it said and rolls back; a run commits, after a snapshot
+  if asked. One failing statement, or a lock it can't get within 15 seconds, changes nothing.
+- **Any PostgreSQL.** A server outside CloudNativePG goes in the catalog with its host, a login and
+  that login's password Secret: it is listed, snapshotted and scripted like the others.
+- **Production is careful.** A restore or a script in a production environment waits for a second
+  person, who reads the script before approving it; snapshots taken there can't be downloaded,
+  and a script's output there names its statements but shows no rows.
 - **Database users**: the owner roles of the databases you see, and the Secrets with their
   passwords.
 - **An audit log** of who asked for what, who approved it and how it ended, per environment.
@@ -134,6 +142,61 @@ spec:
 Without the label, a database belongs to its own namespace (`database`): only who may act there,
 usually the platform team, sees it. Without the annotation, a restore in place scales nothing; the
 owner's other sessions are still ended first.
+
+## External databases
+
+A PostgreSQL server that isn't a CloudNativePG `Database` (a VM, a managed service, another
+operator's cluster) goes under its environment's `external` in the catalog:
+
+```yaml
+environments:
+  - name: acc
+    storage:
+      url: https://<account>.blob.core.windows.net/acc-snapshots
+    external:
+      - name: billing                   # what this app calls it, unique in the environment
+        namespace: acc-billing          # whose people may act on it; empty: the environment's own
+        host: billing-db.example.internal
+        port: 5432                      # the default
+        database: billing               # the database on that server
+        user: billing_owner             # the login the Jobs use
+        passwordSecret: billing-db      # a Secret in the environment's namespace, key `password`
+        caSecret: billing-db-ca         # its `ca.crt` verifies the server
+        tls: verify-full                # the default; or require, or disable
+```
+
+- **The login is what a script can do.** Give the Jobs the schema's owner, as migration scripts
+  need, not a superuser: a superuser's script can do anything to the server.
+- **`verify-full` without a `caSecret`** checks the certificate against the image's public roots
+  (`sslrootcert=system`), for a server with a public certificate. `require` encrypts without
+  checking who answers; `disable` is for a server without TLS on a network you trust.
+- **No restores.** A restore drops everything its login owns first, which on a server this app
+  doesn't manage could be anything. Its snapshots are ordinary `pg_dump` archives: download one
+  outside production, or restore it by hand.
+- **The Jobs must reach it.** If the namespace's NetworkPolicies limit egress, admit the Jobs' pods
+  (`app.kubernetes.io/component: job`) to the server's address and port. The admission policy
+  admits exactly the catalog's host, port, TLS mode and password Secret, so the catalog has to be
+  in the chart's values (`catalog.content` or `catalog.text`).
+
+## What a script does
+
+- **One transaction, every statement or none.** `psql` runs `BEGIN`, `SET LOCAL lock_timeout =
+  '15s'`, the script with `ON_ERROR_STOP`, then `COMMIT` (run) or `ROLLBACK` (check). At the first
+  error psql stops before either and PostgreSQL rolls everything back, so a check shows exactly
+  what a run would do.
+- **No BEGIN, COMMIT or psql commands.** A script that opens or ends a transaction of its own, or
+  holds a backslash command (`\!`, `\connect`, `\o`), is refused before a Job exists, with the
+  line. Statements that can't run in a transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`) fail.
+- **A lock it can't get within 15 seconds fails the script**, rather than queueing the app's own
+  queries behind an `ALTER TABLE` that waits for a long one.
+- **A snapshot first, when asked.** A run can take a snapshot before it starts; if the snapshot
+  fails, the script doesn't run.
+- **What it said.** The last lines of psql's output (statement tags, notices, errors with the
+  script's line numbers, and rows outside production) show under Activity. The script itself is
+  kept beside the snapshots (`scripts/<database>/<id>.sql`) and in the Job, with its sha256 in the
+  audit log.
+- **In production, a second person reads it first.** The request waits, suspended; whoever approves
+  sees the script the Job holds, which can't change after it is created.
 
 ## What a restore does
 
@@ -257,9 +320,13 @@ and a Job's work.
   the reviews ask about nobody and refuse everything.
 - **No passwords in the server.** It reads no Secret; a Job's pod gets the owner's password from
   the kubelet, and the admission policy keeps the server's Jobs to what it builds.
-- **A production restore takes two people.** It is created suspended and starts only when someone
-  else who may restore there approves it; a Job's pod template can't change after creation, so
-  what runs is what was asked for. Unapproved requests expire after a day.
+- **A production restore or script takes two people.** It is created suspended and starts only when
+  someone else who may restore (or run scripts) there approves it; a Job's pod template can't
+  change after creation, so what runs is what was asked for. Unapproved requests expire after a
+  day.
+- **A script runs as the database's owner, never as a superuser the app chose.** For an external
+  database the catalog names the login, and the admission policy holds a script Job to that host,
+  port, TLS mode and password Secret.
 - **Data leaves an environment only when someone who may snapshot it says so**: a share names one
   namespace in one environment, and is in the audit log. Downloads, outside production only,
   stream through the server and are recorded too.

@@ -14,8 +14,8 @@ export function Databases({ env }: { env: Environment }) {
         </h1>
         <p className="muted">
           {env.production
-            ? "Take a snapshot at any time. A restore waits for a second person, and snapshots stay here."
-            : "Take a snapshot, restore one, or clone one another environment shared with you."}{" "}
+            ? "Take a snapshot at any time. A restore or a script waits for a second person, and snapshots stay here."
+            : "Take a snapshot, restore one, run a script, or clone a snapshot another environment shared with you."}{" "}
           You see the databases of the namespaces Kubernetes lets you into.
         </p>
       </div>
@@ -55,6 +55,11 @@ export function Databases({ env }: { env: Environment }) {
                   <a href={`#/${env.name}/databases/${encodeURIComponent(d.name)}`} className="mono">
                     {d.name}
                   </a>
+                  {d.server && (
+                    <span className="badge" title={`${d.server.host}:${d.server.port}/${d.server.database}`}>
+                      external
+                    </span>
+                  )}
                 </td>
                 <td className="mono small">{d.namespace}</td>
                 <td className="mono small">{d.owner || "—"}</td>

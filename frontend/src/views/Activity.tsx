@@ -7,6 +7,7 @@ import { bytes, duration, when } from "../format";
 
 function what(job: Job, env: string): string {
   if (job.action === "snapshot") return "Snapshot";
+  if (job.action === "script") return job.mode === "check" ? "Check a script" : job.snapshot ? "Run a script, after a snapshot" : "Run a script";
   const from = job.source_environment && job.source_environment !== env ? `Clone from ${job.source_environment}/${job.source_database}` : "Restore";
   return job.into === "copy" ? `${from} into ${job.target_database}` : from;
 }
@@ -43,7 +44,7 @@ export function Activity({ env }: { env: Environment }) {
     <>
       <div className="page-head">
         <h1>Activity in {env.name}</h1>
-        <p className="muted">Snapshots and restores of the last week. {env.production && "A restore here starts once a second person approves it."}</p>
+        <p className="muted">Snapshots, restores and scripts of the last week. {env.production && "A restore or a script here starts once a second person approves it."}</p>
         <div className="actions">
           <button type="button" className="button small" onClick={reload}>
             Refresh
@@ -80,6 +81,13 @@ export function Activity({ env }: { env: Environment }) {
                     by {j.requested_by}
                     {j.approved_by && `, approved by ${j.approved_by}`}
                   </div>
+                  {j.script_text && (
+                    // Open while it waits: whoever approves it reads what will run.
+                    <details className="script-details" open={j.state === "waiting"}>
+                      <summary>The script{j.script_sha256 && <span className="muted"> · sha256 {j.script_sha256.slice(0, 12)}</span>}</summary>
+                      <pre className="output">{j.script_text}</pre>
+                    </details>
+                  )}
                 </td>
                 <td className="mono">{j.database}</td>
                 <td>
@@ -87,7 +95,7 @@ export function Activity({ env }: { env: Environment }) {
                   {(j.can_approve || j.can_decline) && (
                     <div className="row-actions">
                       {j.can_approve && (
-                        <button type="button" className="button small primary" disabled={busy === j.name} onClick={() => void act(j, () => api.approve(env.name, j.name), "Approved; the restore starts now.")}>
+                        <button type="button" className="button small primary" disabled={busy === j.name} onClick={() => void act(j, () => api.approve(env.name, j.name), j.action === "script" ? "Approved; the script starts now." : "Approved; the restore starts now.")}>
                           Approve
                         </button>
                       )}
@@ -101,11 +109,24 @@ export function Activity({ env }: { env: Environment }) {
                 </td>
                 <td className="small">
                   {j.result.result === "succeeded" ? (
-                    <>
-                      {bytes(j.result.bytes)} in {duration(j.result.seconds)}
-                    </>
+                    j.action === "script" ? (
+                      <>
+                        {j.result.mode === "check" ? "Checked, rolled back" : "Committed"} in {duration(j.result.seconds)}
+                        {j.result.bytes ? `, after a snapshot of ${bytes(j.result.bytes)}` : ""}
+                      </>
+                    ) : (
+                      <>
+                        {bytes(j.result.bytes)} in {duration(j.result.seconds)}
+                      </>
+                    )
                   ) : (
                     j.result.reason && <span className="danger-text">{j.result.reason}</span>
+                  )}
+                  {j.result.output && (
+                    <details className="script-details" open={j.result.result === "failed"}>
+                      <summary>Output</summary>
+                      <pre className="output">{j.result.output}</pre>
+                    </details>
                   )}
                 </td>
               </tr>
@@ -115,7 +136,7 @@ export function Activity({ env }: { env: Environment }) {
       )}
       {declining && (
         <Confirm
-          title={declining.can_approve ? "Decline this restore?" : "Withdraw your request?"}
+          title={declining.can_approve ? `Decline this ${declining.action}?` : "Withdraw your request?"}
           action={declining.can_approve ? "Decline" : "Withdraw"}
           danger
           busy={busy === declining.name}

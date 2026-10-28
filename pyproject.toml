@@ -2,7 +2,7 @@
 name = "databases-ui"
 # The release version lives in the git tag and reaches the image as APP_VERSION.
 version = "0.0.0"
-description = "Let app teams snapshot, restore and clone their own PostgreSQL databases on CloudNativePG, without platform help"
+description = "Let app teams snapshot, restore and clone their own PostgreSQL databases on CloudNativePG, and run migration scripts on any PostgreSQL, without platform help"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"

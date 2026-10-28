@@ -2,10 +2,11 @@
 
 Every action is a Job in the environment's namespace, running this app's own image as
 `python -m databases_ui job` (runner.py). Its pod connects as the database's owner role with the
-password from that managed role's Secret, mounted by the kubelet: neither this server nor its
-Kubernetes role ever reads a password. A restore that needs a second person is created
-suspended; approving it lets it start, and a Job's pod template can't change after creation, so
-what runs is exactly what was asked for.
+password from that managed role's Secret (for an external database, the catalog's login and
+Secret), mounted by the kubelet: neither this server nor its Kubernetes role ever reads a
+password. A restore or a script that needs a second person is created suspended; approving it
+lets it start, and a Job's pod template can't change after creation, so what runs is exactly what
+was asked for, down to the script, which travels in the Job itself.
 """
 
 from __future__ import annotations
@@ -22,8 +23,19 @@ PREFIX = "databases-ui/"
 MANAGED_BY = "app.kubernetes.io/managed-by"
 APP = "databases-ui"
 TOKEN_DIR = "/var/run/secrets/azure/tokens"  # nosec B105 - where the kubelet mounts the token, not a token
+CA_DIR = "/etc/databases-ui/ca"
 DEADLINE_SECONDS = 6 * 3600
 KEEP_SECONDS = 7 * 86400
+
+
+@dataclass(frozen=True)
+class Script:
+    """A script to run: its text, check (roll back) or run (commit), and where its copy is kept."""
+
+    text: str
+    mode: str
+    blob: str
+    snapshot_first: bool = False
 
 
 @dataclass(frozen=True)
@@ -34,10 +46,13 @@ class Target:
     database: str
     owner: str
     password_secret: str
+    # A Secret whose ca.crt verifies the server; empty: the image's public roots (verify-full) or none.
     ca_secret: str
     host: str
     # The app's namespace, whose people may act on the database.
     namespace: str
+    port: int = 5432
+    sslmode: str = "verify-full"
 
 
 def name_for(action: str) -> str:
@@ -76,9 +91,17 @@ def build(
     metadata: dict[str, str] | None = None,
     workloads: tuple[tuple[str, str, str], ...] = (),
     wait_for_database: bool = False,
+    script: Script | None = None,
 ) -> dict[str, Any]:
     """The Job for one action. `database` is the catalog's name, `target.database` the one written to."""
     labels = {MANAGED_BY: APP, f"{PREFIX}environment": env.name, f"{PREFIX}database": database, f"{PREFIX}namespace": target.namespace, f"{PREFIX}action": action}
+    if target.ca_secret:
+        root = [{"name": "PGSSLROOTCERT", "value": f"{CA_DIR}/ca.crt"}]
+    elif target.sslmode == "verify-full":
+        # libpq 16 and later: the operating system's roots, for a server with a public certificate.
+        root = [{"name": "PGSSLROOTCERT", "value": "system"}]
+    else:
+        root = []
     variables: list[dict[str, Any]] = [
         {"name": "DBUI_ACTION", "value": action},
         {"name": "DBUI_JOB", "value": name},
@@ -90,12 +113,12 @@ def build(
         {"name": "DBUI_BLOB", "value": blob},
         {"name": "DBUI_AUDIT_URL", "value": env.storage.url},
         {"name": "PGHOST", "value": target.host},
-        {"name": "PGPORT", "value": "5432"},
+        {"name": "PGPORT", "value": str(target.port)},
         {"name": "PGDATABASE", "value": target.database},
         {"name": "PGUSER", "value": target.owner},
         {"name": "PGPASSWORD", "valueFrom": {"secretKeyRef": {"name": target.password_secret, "key": "password"}}},
-        {"name": "PGSSLMODE", "value": "verify-full"},
-        {"name": "PGSSLROOTCERT", "value": "/etc/databases-ui/ca/ca.crt"},
+        {"name": "PGSSLMODE", "value": target.sslmode},
+        *root,
         {"name": "PGAPPNAME", "value": "databases-ui"},
         {"name": "PGCONNECT_TIMEOUT", "value": "15"},
         {"name": "HOME", "value": "/tmp"},  # nosec B108 - the pod's own emptyDir, mounted below
@@ -107,12 +130,22 @@ def build(
         variables.append({"name": "DBUI_SCALE", "value": json.dumps([list(w) for w in workloads])})
     if wait_for_database:
         variables.append({"name": "DBUI_WAIT_FOR_DATABASE", "value": "1"})
-    volumes: list[dict[str, Any]] = [
-        {"name": "tmp", "emptyDir": {"sizeLimit": "64Mi"}},
-        # The server's CA certificate only: the Secret also holds the CA's key.
-        {"name": "ca", "secret": {"secretName": target.ca_secret, "defaultMode": 0o440, "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
-    ]
-    mounts = [{"name": "tmp", "mountPath": "/tmp"}, {"name": "ca", "mountPath": "/etc/databases-ui/ca", "readOnly": True}]  # nosec B108 - an emptyDir no other pod shares
+    if script is not None:
+        variables += [
+            {"name": "DBUI_SCRIPT", "value": script.text},
+            {"name": "DBUI_SCRIPT_MODE", "value": script.mode},
+            {"name": "DBUI_SCRIPT_BLOB", "value": script.blob},
+            # Production shows command tags and errors, never rows: its data stays there.
+            {"name": "DBUI_SCRIPT_OUTPUT", "value": "tags" if env.production else "full"},
+        ]
+        if script.snapshot_first:
+            variables.append({"name": "DBUI_SNAPSHOT_FIRST", "value": "1"})
+    volumes: list[dict[str, Any]] = [{"name": "tmp", "emptyDir": {"sizeLimit": "64Mi"}}]
+    mounts = [{"name": "tmp", "mountPath": "/tmp"}]  # nosec B108 - an emptyDir no other pod shares
+    if target.ca_secret:
+        # The server's CA certificate only: a CloudNativePG CA Secret also holds the CA's key.
+        volumes.append({"name": "ca", "secret": {"secretName": target.ca_secret, "defaultMode": 0o440, "items": [{"key": "ca.crt", "path": "ca.crt"}]}})
+        mounts.append({"name": "ca", "mountPath": CA_DIR, "readOnly": True})
     if not cfg.storage_sas_secret:
         volumes.append(
             {
@@ -156,6 +189,21 @@ def build(
             },
         },
     }
+
+
+def action_of(job: dict[str, Any]) -> str:
+    return ((job.get("metadata") or {}).get("labels") or {}).get(f"{PREFIX}action", "")
+
+
+def script_of(job: dict[str, Any]) -> str:
+    """The script a script Job runs, read from its pod template."""
+    if action_of(job) != "script":
+        return ""
+    for container in (((job.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers") or []:
+        for variable in container.get("env") or []:
+            if variable.get("name") == "DBUI_SCRIPT":
+                return str(variable.get("value") or "")
+    return ""
 
 
 def state(job: dict[str, Any]) -> str:

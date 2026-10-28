@@ -1,6 +1,6 @@
 apiVersion: v2
 name: databases-ui
-description: Let app teams snapshot, restore and clone their own PostgreSQL databases on CloudNativePG, with Entra ID sign-in, Kubernetes Jobs and Azure Blob Storage.
+description: Let app teams snapshot, restore and clone their own PostgreSQL databases on CloudNativePG, and run migration scripts on them or any other PostgreSQL, with Entra ID sign-in, Kubernetes Jobs and Azure Blob Storage.
 type: application
 
 # version is the CHART version and appVersion the application version. The release
@@ -33,4 +33,6 @@ annotations:
       url: https://github.com/MagmaMoose/databases-ui
   artifacthub.io/changes: |
     - kind: added
-      description: First release.
+      description: Scripts, checked (rolled back) or run (committed, after a snapshot if asked), with a second person in production.
+    - kind: added
+      description: External databases, any PostgreSQL the catalog names, for snapshots and scripts.

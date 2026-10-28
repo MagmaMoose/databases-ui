@@ -22,7 +22,9 @@ SNAPSHOT = "snapshots/payments_dev/20261023T140000Z-abcdef.dump"
 @pytest.fixture
 def tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """pg_dump writes DUMP_BYTES bytes (or fails with DUMP_FAIL), pg_restore keeps what it read and
-    its arguments, psql answers 2 and keeps its SQL."""
+    its arguments, psql answers 2 and keeps its SQL. Run as a script's psql (its last argument
+    COMMIT or ROLLBACK), psql keeps its arguments and the script, prints a tag, a row and its last
+    command, or fails at line 2 with SCRIPT_FAIL."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     scripts = {
@@ -31,6 +33,9 @@ def tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "pg_restore": '#!/bin/sh\necho "$@" > "$OUT/restore-args"\nif [ -n "$RESTORE_FAIL" ]; then head -c 3; echo "pg_restore: error: $RESTORE_FAIL" >&2; exit 1; fi\ncat\n',
         "psql": (
             '#!/bin/sh\nfor last; do :; done\n'
+            'if [ "$last" = "COMMIT" ] || [ "$last" = "ROLLBACK" ]; then echo "$@" > "$OUT/script-args"; cat > "$OUT/script-text"; '
+            'printf "BEGIN\\nSET\\nINSERT 0 1\\n customer \\n----------\\n Ada\\n(1 row)\\n\\n"; '
+            'if [ -n "$SCRIPT_FAIL" ]; then echo "psql:<stdin>:2: ERROR:  $SCRIPT_FAIL" >&2; exit 3; fi; echo "$last"; exit 0; fi\n'
             'if [ "$last" = "--file=-" ]; then echo "$@" > "$OUT/psql-args"; cat > "$OUT/script"; '
             'if [ -n "$SCRIPT_FAIL" ]; then echo "psql:<stdin>:9: ERROR: $SCRIPT_FAIL" >&2; exit 3; fi; exit 0; fi\n'
             'echo "$last" >> "$OUT/psql"\nif [ -n "$PSQL_FAIL" ]; then echo "psql: error: $PSQL_FAIL" >&2; exit 2; fi\necho 2\n'
@@ -173,3 +178,65 @@ def test_a_missing_snapshot_or_action_fails_cleanly(world, tools, tmp_path):
     assert code == 1 and "404" in outcome["reason"]
     code, outcome = run(world, job_env(tmp_path, "vacuum"))
     assert code == 1 and outcome["reason"] == "unknown action 'vacuum'"
+
+
+SCRIPT = "insert into menu (code) values ('A');\ninsert into menu (code) values ('B');\n"
+
+
+def script_env(tmp_path: Path, mode: str = "check", **extra: str) -> dict[str, str]:
+    defaults = {"DBUI_SCRIPT": SCRIPT, "DBUI_SCRIPT_MODE": mode, "DBUI_SCRIPT_OUTPUT": "full", "DBUI_SCRIPT_BLOB": "scripts/payments_dev/20261023T140000Z-abcdef.sql", "DBUI_BLOB": ""}
+    return job_env(tmp_path, "script", **{**defaults, **extra})
+
+
+def test_a_check_runs_the_script_between_begin_and_rollback(world, tools, tmp_path):
+    code, outcome = run(world, script_env(tmp_path))
+    assert code == 0 and outcome["result"] == "succeeded" and outcome["mode"] == "check", outcome
+    assert (tools / "script-args").read_text().strip() == "--no-password --no-psqlrc -v ON_ERROR_STOP=1 -c BEGIN -c SET LOCAL lock_timeout = '15s' --file=- -c ROLLBACK"
+    assert (tools / "script-text").read_text() == SCRIPT
+    assert outcome["output"].splitlines() == ["BEGIN", "SET", "INSERT 0 1", " customer ", "----------", " Ada", "(1 row)", "", "ROLLBACK"]
+    assert not any(k.startswith("dev/snapshots/") for k in world.storage.blobs)
+    entry = world.storage.audit("dev")[0]
+    assert entry["action"] == "script.checked" and entry["script"] == "scripts/payments_dev/20261023T140000Z-abcdef.sql" and "snapshot" not in entry
+
+
+def test_a_run_takes_its_snapshot_first_and_commits(world, tools, tmp_path):
+    code, outcome = run(world, script_env(tmp_path, "run", DBUI_SNAPSHOT_FIRST="1", DBUI_BLOB=SNAPSHOT, DBUI_METADATA=json.dumps({"note": "before script"})))
+    assert code == 0 and outcome["bytes"] == 105 and outcome["output"].endswith("COMMIT"), outcome
+    assert world.storage.blobs[f"dev/{SNAPSHOT}"].data.startswith(b"PGDMP")
+    assert (tools / "script-args").read_text().split()[-2:] == ["-c", "COMMIT"]
+    assert [e["action"] for e in world.storage.audit("dev")] == ["script.succeeded"]
+
+
+def test_a_failed_snapshot_runs_no_script(world, tools, tmp_path, monkeypatch):
+    monkeypatch.setenv("DUMP_FAIL", "permission denied for schema private")
+    code, outcome = run(world, script_env(tmp_path, "run", DBUI_SNAPSHOT_FIRST="1", DBUI_BLOB=SNAPSHOT))
+    assert code == 1 and "permission denied" in outcome["reason"] and not (tools / "script-args").exists()
+
+
+def test_production_output_keeps_tags_and_messages_never_rows(world, tools, tmp_path, monkeypatch):
+    code, outcome = run(world, script_env(tmp_path, "run", DBUI_SCRIPT_OUTPUT="tags"))
+    assert code == 0 and outcome["output"].splitlines() == ["BEGIN", "SET", "INSERT 0 1", "COMMIT"], outcome
+    monkeypatch.setenv("SCRIPT_FAIL", 'duplicate key value violates unique constraint "menu_pkey"')
+    code, outcome = run(world, script_env(tmp_path, "run", DBUI_SCRIPT_OUTPUT="tags"))
+    assert code == 1 and "Ada" not in outcome["output"] and outcome["output"].splitlines()[-1].startswith("psql:<stdin>:2: ERROR:")
+
+
+def test_a_failed_script_changes_nothing_and_says_where(world, tools, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCRIPT_FAIL", 'relation "menu" does not exist')
+    code, outcome = run(world, script_env(tmp_path, "run"))
+    assert code == 1 and outcome["result"] == "failed"
+    assert outcome["reason"] == 'nothing changed: psql:<stdin>:2: ERROR:  relation "menu" does not exist', outcome["reason"]
+    assert "ROLLBACK" not in outcome["output"] and "COMMIT" not in outcome["output"]
+    entry = world.storage.audit("dev")[0]
+    assert entry["action"] == "script.failed" and "does not exist" in entry["detail"]
+
+
+def test_a_script_that_should_have_been_refused_never_reaches_psql(world, tools, tmp_path):
+    code, outcome = run(world, {**script_env(tmp_path, "run"), "DBUI_SCRIPT": "select 1;\ncommit;"})
+    assert code == 1 and "Line 2: COMMIT" in outcome["reason"] and not (tools / "script-args").exists()
+
+
+def test_the_termination_message_stays_valid_json_under_kubernetes_cap():
+    outcome = {"result": "failed", "reason": "x" * 600, "output": "\n".join(f'"row {n}"\t\\' for n in range(2000)), "seconds": 3}
+    message = runner.termination_message(dict(outcome))
+    assert len(message.encode()) <= 4000 and json.loads(message)["output"].endswith('"row 1999"\t\\')

@@ -89,7 +89,7 @@ export function App() {
         <div className="card sign-in">
           <Logo />
           <h1>Databases UI</h1>
-          <p className="muted">{state === "ended" ? "Your session has ended." : "Sign in with your work account to snapshot, restore and clone the databases of your namespaces."}</p>
+          <p className="muted">{state === "ended" ? "Your session has ended." : "Sign in with your work account to snapshot, restore and clone the databases of your namespaces, and run scripts on them."}</p>
           {authError && (
             <p className="notice error" role="alert">
               {authError}

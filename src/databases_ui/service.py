@@ -1,11 +1,12 @@
 """What people may do, and doing it: an environment's databases and their owners, snapshots, and
-the Jobs that take, restore and clone them.
+the Jobs that take, restore and clone them and run scripts on them.
 
 Who may act on a database is Kubernetes' answer. A Database resource names, in a label, the
-namespace of the app it belongs to (without one, its own namespace: the platform's); the server
-asks the API server, with a SubjectAccessReview, whether the signed-in person may do there what
-the action takes (catalog.py: `view` to see, `edit` to snapshot and restore, `admin` to restore
-production). Answers are kept for a minute. In a production environment a restore also waits for
+namespace of the app it belongs to (without one, its own namespace: the platform's), and so does
+an external database in the catalog; the server asks the API server, with a SubjectAccessReview,
+whether the signed-in person may do there what the action takes (catalog.py: `view` to see,
+`edit` to snapshot, restore and run scripts, `admin` to restore or run a script in production).
+Answers are kept for a minute. In a production environment a restore or a script also waits for
 a second person, and nobody downloads a snapshot.
 
 Another environment's snapshot reaches this one only when someone who may snapshot it there shares
@@ -18,16 +19,16 @@ import asyncio
 import re
 import secrets
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from . import audit, jobs
+from . import audit, jobs, sql
 from .blob import Container
 from .catalog import DATABASE, NAMESPACE, Environment
 from .config import Config
-from .kube import CNPG, Kube
+from .kube import CNPG, Kube, KubeError
 
 APPROVAL_HOURS = 24
 REVIEW_SECONDS = 60
@@ -36,7 +37,7 @@ WORKLOADS = f"{jobs.PREFIX}workloads"
 _WORKLOAD = re.compile(r"^(deployment|statefulset)/([a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?)$")
 _ACTIVE = ("waiting", "starting", "running")
 _COPY = "_copy"
-Action = Literal["read", "snapshot", "restore"]
+Action = Literal["read", "snapshot", "restore", "script"]
 
 
 class ConsoleError(Exception):
@@ -58,6 +59,19 @@ class Actor:
 
 def snapshot_blob(database: str, snapshot: str) -> str:
     return f"snapshots/{database}/{snapshot}.dump"
+
+
+def script_blob(database: str, script: str) -> str:
+    return f"scripts/{database}/{script}.sql"
+
+
+async def _once(data: bytes) -> AsyncIterator[bytes]:
+    yield data
+
+
+def _decides(action: str) -> Action:
+    """What approving or declining a request takes: what asking for it took."""
+    return "script" if action == "script" else "restore"
 
 
 def _iso(at: datetime) -> str:
@@ -146,8 +160,19 @@ class Console:
             raise ConsoleError(404, "unknown_database", "That is not a database name this app takes.")
 
     async def _resources(self, env: Environment) -> list[dict[str, Any]]:
-        found = await self._kube_for(env).list(f"{CNPG}/namespaces/{env.namespace}/databases")
-        return [d for d in found if ((d.get("spec") or {}).get("cluster") or {}).get("name") == env.cnpg_cluster and (d.get("spec") or {}).get("ensure") != "absent"]
+        try:
+            found = await self._kube_for(env).list(f"{CNPG}/namespaces/{env.namespace}/databases")
+        except KubeError as err:
+            # No CloudNativePG in this cluster: only the catalog's external databases.
+            if err.status == 404:
+                return []
+            raise
+        return [
+            d for d in found
+            if ((d.get("spec") or {}).get("cluster") or {}).get("name") == env.cnpg_cluster and (d.get("spec") or {}).get("ensure") != "absent"
+            # The catalog's external database of the same name is the one this app shows.
+            and env.server((d.get("spec") or {}).get("name", "")) is None
+        ]  # fmt: skip
 
     def _copy_of(self, resource: dict[str, Any]) -> str:
         return ((resource.get("metadata") or {}).get("labels") or {}).get(f"{jobs.PREFIX}copy-of", "")
@@ -159,10 +184,15 @@ class Console:
             raise ConsoleError(404, "unknown_database", f"{env.name} has no database {database!r}.")
         return found
 
-    async def _database(self, actor: Actor, env: Environment, database: str) -> tuple[dict[str, Any], str]:
-        """A database and its namespace, if this person may see it: to anyone else it does not exist."""
-        resource = await self._resource(env, database)
-        namespace = self.namespace_of(env, resource)
+    async def _database(self, actor: Actor, env: Environment, database: str) -> tuple[dict[str, Any] | None, str]:
+        """A database's Database resource (None for an external one) and its namespace, if this
+        person may see it: to anyone else it does not exist."""
+        self._check_name(database)
+        if (server := env.server(database)) is not None and env.runs_jobs:
+            resource, namespace = None, server.namespace or env.namespace
+        else:
+            resource = await self._resource(env, database)
+            namespace = self.namespace_of(env, resource)
         if not await self.allowed(actor, env, namespace, "read"):
             raise ConsoleError(404, "unknown_database", f"{env.name} has no database {database!r}.")
         return resource, namespace
@@ -194,15 +224,26 @@ class Console:
         resources = await self._resources(env)
         own = {d["spec"].get("name", ""): d for d in resources if not self._copy_of(d)}
         copies = {self._copy_of(d): d for d in resources if self._copy_of(d)}
-        spaces = {db: self.namespace_of(env, d) for db, d in own.items()}
+        spaces = {db: self.namespace_of(env, d) for db, d in own.items()} | {s.name: s.namespace or env.namespace for s in env.external}
         seen = await self._answers(actor, env, spaces.values(), "read")
-        visible = [db for db in sorted(own) if seen[spaces[db]]]
+        visible = [db for db in sorted(spaces) if seen[spaces[db]]]
         snapshot = await self._answers(actor, env, (spaces[db] for db in visible), "snapshot")
         restore = await self._answers(actor, env, (spaces[db] for db in visible), "restore")
-        roles = self._roles(await self._cluster(env)) if visible else {}
+        script = await self._answers(actor, env, (spaces[db] for db in visible), "script")
+        roles = self._roles(await self._cluster(env)) if any(db in own for db in visible) else {}
         out = []
         for db in visible:
-            d, ns = own[db], spaces[db]
+            ns = spaces[db]
+            if (server := env.server(db)) is not None:
+                out.append(
+                    {
+                        "name": db, "kind": "external", "namespace": ns, "owner": server.user, "owner_secret": server.password_secret, "ready": True, "message": "",
+                        "server": {"host": server.host, "port": server.port, "database": server.database, "tls": server.tls},
+                        "workloads": [], "copy": None, "can_snapshot": snapshot[ns], "can_restore": False, "can_script": script[ns],
+                    }
+                )  # fmt: skip
+                continue
+            d = own[db]
             copy = copies.get(db)
             try:
                 workloads = [f"{kind}/{wname}" for kind, _, wname in self.workloads(d, ns)]
@@ -212,27 +253,32 @@ class Console:
             out.append(
                 {
                     "name": db,
+                    "kind": "cloudnativepg",
                     "namespace": ns,
                     "owner": owner,
                     "owner_secret": ((roles.get(owner) or {}).get("passwordSecret") or {}).get("name", ""),
                     "ready": bool((d.get("status") or {}).get("applied")),
                     "message": (d.get("status") or {}).get("message", ""),
+                    "server": None,
                     "workloads": workloads,
                     "copy": None if copy is None else {"name": copy["spec"].get("name", ""), "ready": bool((copy.get("status") or {}).get("applied"))},
                     "can_snapshot": snapshot[ns],
                     "can_restore": restore[ns],
+                    "can_script": script[ns],
                 }
             )
         return out
 
     async def users(self, actor: Actor, name: str) -> list[dict[str, Any]]:
-        """The owner roles of the databases this person sees, from the Cluster's managed roles."""
+        """The owner roles of the databases this person sees, from the Cluster's managed roles, and
+        the logins the catalog gives external databases."""
         found = await self.databases(actor, name)
         if not found:
             return []
-        roles = self._roles(await self._cluster(self.environment(name)))
+        native = [d for d in found if d["kind"] != "external"]
+        roles = self._roles(await self._cluster(self.environment(name))) if native else {}
         out = []
-        for owner in sorted({d["owner"] for d in found}):
+        for owner in sorted({d["owner"] for d in native}):
             role = roles.get(owner)
             out.append(
                 {
@@ -240,13 +286,31 @@ class Console:
                     "managed": role is not None,
                     "login": bool((role or {}).get("login")),
                     "secret": ((role or {}).get("passwordSecret") or {}).get("name", ""),
-                    "databases": [d["name"] for d in found if d["owner"] == owner],
-                    "namespaces": sorted({d["namespace"] for d in found if d["owner"] == owner}),
+                    "databases": [d["name"] for d in native if d["owner"] == owner],
+                    "namespaces": sorted({d["namespace"] for d in native if d["owner"] == owner}),
+                    "server": "",
                 }
             )
+        for d in found:
+            if d["kind"] == "external":
+                server = d["server"]
+                out.append(
+                    {
+                        "name": d["owner"], "managed": False, "login": True, "secret": d["owner_secret"], "databases": [d["name"]], "namespaces": [d["namespace"]],
+                        "server": f"{server['host']}:{server['port']}/{server['database']}",
+                    }
+                )  # fmt: skip
         return out
 
-    async def _target(self, env: Environment, resource: dict[str, Any], database: str, namespace: str) -> jobs.Target:
+    async def _target(self, env: Environment, resource: dict[str, Any] | None, database: str, namespace: str) -> jobs.Target:
+        if resource is None:
+            server = env.server(database)
+            if server is None:
+                raise ConsoleError(404, "unknown_database", f"{env.name} has no database {database!r}.")
+            return jobs.Target(
+                environment=env.name, database=server.database, owner=server.user, password_secret=server.password_secret, ca_secret=server.ca_secret,
+                host=server.host, namespace=namespace, port=server.port, sslmode=server.tls,
+            )  # fmt: skip
         owner = resource["spec"].get("owner", "")
         cluster = await self._cluster(env)
         secret = ((self._roles(cluster).get(owner) or {}).get("passwordSecret") or {}).get("name")
@@ -342,6 +406,8 @@ class Console:
         blob = snapshot_blob(source_database, self._snapshot_id(snapshot))
         resource, namespace = await self._database(actor, env, database)
         await self._require(actor, env, namespace, "restore")
+        if resource is None:
+            raise ConsoleError(409, "external", f"{database} is an external database: this app snapshots it and runs scripts on it, but restores only CloudNativePG databases.")
         if source.name != env.name and source.name not in env.clone_from:
             raise ConsoleError(403, "no_clone", f"{env.name} takes no snapshots from {source.name}.")
         if source.name == env.name and source_database != database:
@@ -406,8 +472,10 @@ class Console:
 
     async def drop_copy(self, actor: Actor, name: str, database: str) -> None:
         env = self.environment(name)
-        _, namespace = await self._database(actor, env, database)
+        resource, namespace = await self._database(actor, env, database)
         await self._require(actor, env, namespace, "restore")
+        if resource is None:
+            raise ConsoleError(404, "no_copy", f"{database} has no copy.")
         await self._busy(env, database)
         path = f"{CNPG}/namespaces/{env.namespace}/databases"
         copy = next(iter(await self._kube_for(env).list(path, f"{jobs.MANAGED_BY}={jobs.APP},{jobs.PREFIX}copy-of={database}")), None)
@@ -428,6 +496,48 @@ class Console:
             raise ConsoleError(404, "unknown_snapshot", f"{env.name} has no snapshot {snapshot} of {database}.")
         await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action="snapshot.downloaded", database=database, namespace=namespace, snapshot=blob)
         return self._storage[env.name], blob, f"{env.name}-{database}-{snapshot}.dump"
+
+    # ── Scripts ─────────────────────────────────────────────────────────────────────
+
+    async def run_script(self, actor: Actor, name: str, database: str, *, script: str, mode: Literal["check", "run"], reason: str, snapshot_first: bool) -> dict[str, Any]:
+        """A Job that runs `script` in one transaction as the database's owner: rolled back (check)
+        or committed (run), after a snapshot when asked. In production it waits for a second person,
+        who sees the script; a copy of it is kept in storage beside the snapshots."""
+        env = self.environment(name)
+        resource, namespace = await self._database(actor, env, database)
+        await self._require(actor, env, namespace, "script")
+        if found := sql.problems(script):
+            raise ConsoleError(422, "script_refused", " ".join(found[:5]))
+        await self._busy(env, database)
+        target = await self._target(env, resource, database, namespace)
+        now = self._now()
+        sid = f"{now:%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}"
+        job_name = jobs.name_for("script")
+        first = snapshot_first and mode == "run"
+        blob = script_blob(database, sid)
+        _, digest = await self._storage[env.name].upload(
+            blob, _once(script.encode()),
+            {"createdby": actor.upn, "created": _iso(now), "reason": reason, "mode": mode, "environment": env.name, "database": database, "namespace": namespace, "job": job_name},
+        )  # fmt: skip
+        manifest = jobs.build(
+            self.cfg, env, name=job_name, action="script", target=target, database=database, blob_url=env.storage.url,
+            blob=snapshot_blob(database, sid) if first else "", requested_by=actor.upn,
+            annotations={
+                "requested-by": actor.upn, "requested-at": _iso(now), "reason": reason, "mode": mode, "script": sid, "script-sha256": digest,
+                "snapshot": sid if first else "", "approval": "required" if env.production else "",
+            },
+            metadata={
+                "createdby": actor.upn, "created": _iso(now), "note": f"before script {sid}: {reason}"[:300], "environment": env.name, "database": database,
+                "namespace": namespace, "job": job_name,
+            } if first else None,
+            suspend=env.production, script=jobs.Script(text=script, mode=mode, blob=blob, snapshot_first=first),
+        )  # fmt: skip
+        job = await self._kube_for(env).create(f"/apis/batch/v1/namespaces/{env.namespace}/jobs", manifest)
+        await audit.record(
+            self._storage[env.name], environment=env.name, actor=actor.upn, action="script.requested", at=now, database=database, namespace=namespace, job=job_name,
+            script=blob, detail=f"{mode}: {reason}",
+        )  # fmt: skip
+        return self._job_json(env, job, None, can_approve=False, can_decline=env.production)
 
     # ── Jobs ────────────────────────────────────────────────────────────────────────
 
@@ -461,6 +571,11 @@ class Console:
             "into": a.get("into", ""),
             "target_database": a.get("target-database", ""),
             "approval": a.get("approval", ""),
+            "mode": a.get("mode", ""),
+            "script": a.get("script", ""),
+            "script_sha256": a.get("script-sha256", ""),
+            # What the Job runs, from the Job itself: what an approver approves is what runs.
+            "script_text": jobs.script_of(job),
             "started": status.get("startTime", ""),
             "finished": status.get("completionTime", "") or next((c.get("lastTransitionTime", "") for c in status.get("conditions") or [] if c.get("type") == "Failed"), ""),
             "result": jobs.result(pod),
@@ -484,17 +599,21 @@ class Console:
         live = []
         for job in found:
             if self._expired(job):
-                await self._drop(env, job, actor="databases-ui", action="restore.expired")
+                await self._drop(env, job, actor="databases-ui", action=f"{jobs.action_of(job)}.expired")
             else:
                 live.append(job)
         spaces = [self._namespace_of_job(env, j) for j in live]
         seen = await self._answers(actor, env, spaces, "read")
-        restore = await self._answers(actor, env, (ns for ns in spaces if seen[ns]), "restore")
+        decides = {
+            action: await self._answers(actor, env, (ns for ns in spaces if seen[ns]), action)  # type: ignore[arg-type]
+            for action in ("restore", "script")
+        }
         out = []
         for job, ns in zip(live, spaces, strict=True):
             if seen[ns]:
                 mine = (job["metadata"].get("annotations") or {}).get(f"{jobs.PREFIX}requested-by") == actor.upn
-                out.append(self._job_json(env, job, pods.get(job["metadata"]["name"]), can_approve=restore[ns] and not mine, can_decline=restore[ns] or mine))
+                may = decides[_decides(jobs.action_of(job))][ns]
+                out.append(self._job_json(env, job, pods.get(job["metadata"]["name"]), can_approve=may and not mine, can_decline=may or mine))
         return sorted(out, key=lambda j: j["requested_at"], reverse=True)
 
     async def _waiting(self, actor: Actor, env: Environment, job_name: str) -> tuple[dict[str, Any], str]:
@@ -516,20 +635,22 @@ class Console:
         asked_by = (job["metadata"].get("annotations") or {}).get(f"{jobs.PREFIX}requested-by", "")
         if actor.upn == asked_by:
             raise ConsoleError(403, "own_request", "A second person approves this, not the one who asked.")
-        await self._require(actor, env, namespace, "restore")
+        action = jobs.action_of(job)
+        await self._require(actor, env, namespace, _decides(action))
         now = self._now()
         patch = {"metadata": {"annotations": {f"{jobs.PREFIX}approved-by": actor.upn, f"{jobs.PREFIX}approved-at": _iso(now)}}, "spec": {"suspend": False}}
         job = await self._kube_for(env).patch(f"/apis/batch/v1/namespaces/{env.namespace}/jobs/{job_name}", patch)
         database = (job["metadata"].get("labels") or {}).get(f"{jobs.PREFIX}database", "")
-        await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action="restore.approved", at=now, database=database, namespace=namespace, job=job_name, detail=f"asked by {asked_by}")
+        await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action=f"{action}.approved", at=now, database=database, namespace=namespace, job=job_name, detail=f"asked by {asked_by}")
         return self._job_json(env, job, None, can_approve=False, can_decline=False)
 
     async def decline(self, actor: Actor, name: str, job_name: str, reason: str) -> None:
         env = self.environment(name)
         job, namespace = await self._waiting(actor, env, job_name)
+        action = jobs.action_of(job)
         if (job["metadata"].get("annotations") or {}).get(f"{jobs.PREFIX}requested-by") != actor.upn:
-            await self._require(actor, env, namespace, "restore")
-        await self._drop(env, job, actor=actor.upn, action="restore.declined", detail=reason)
+            await self._require(actor, env, namespace, _decides(action))
+        await self._drop(env, job, actor=actor.upn, action=f"{action}.declined", detail=reason)
 
     async def _drop(self, env: Environment, job: dict[str, Any], *, actor: str, action: str, detail: str = "") -> None:
         meta = job["metadata"]

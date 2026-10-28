@@ -51,8 +51,8 @@ def test_databases_follow_kubernetes_access_per_namespace(client, world):
     found = client.get("/api/environments/dev/databases").json()["databases"]
     assert found == [
         {
-            "name": "payments_dev", "namespace": "dev-payments", "owner": "payments_dev", "owner_secret": "payments_dev-db", "ready": True, "message": "",
-            "workloads": ["deployment/api", "statefulset/worker"], "copy": None, "can_snapshot": True, "can_restore": True,
+            "name": "payments_dev", "kind": "cloudnativepg", "namespace": "dev-payments", "owner": "payments_dev", "owner_secret": "payments_dev-db", "ready": True,
+            "message": "", "server": None, "workloads": ["deployment/api", "statefulset/worker"], "copy": None, "can_snapshot": True, "can_restore": True, "can_script": True,
         }
     ]  # fmt: skip
     spec = world.kube.reviews[0]
@@ -93,7 +93,7 @@ def test_access_per_environment_comes_from_the_catalog(world, env, tmp_path):
 def test_users_are_the_owners_of_the_databases_you_see(client, world):
     sign_in(client, world)
     assert client.get("/api/environments/dev/users").json()["users"] == [
-        {"name": "payments_dev", "managed": True, "login": True, "secret": "payments_dev-db", "databases": ["payments_dev"], "namespaces": ["dev-payments"]}
+        {"name": "payments_dev", "managed": True, "login": True, "secret": "payments_dev-db", "databases": ["payments_dev"], "namespaces": ["dev-payments"], "server": ""}
     ]
     sign_in(client, world, "root@example.com")
     users = {u["name"]: u for u in client.get("/api/environments/dev/users").json()["users"]}
