@@ -391,7 +391,7 @@ class Console:
             raise ConsoleError(404, "unknown_snapshot", f"{env.name} has no snapshot {snapshot} of {database}.")
         shares = sorted(set(_shares(found.metadata)) | {f"{target.name}/{namespace}"})
         await self._storage[env.name].set_metadata(blob, {**found.metadata, "sharedwith": " ".join(shares)})
-        await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action="snapshot.shared", database=database, namespace=source, snapshot=blob, target=f"{target.name}/{namespace}")
+        await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action="snapshot.shared", at=self._now(), database=database, namespace=source, snapshot=blob, target=f"{target.name}/{namespace}")
         return self._snapshot_json(env.name, database, snapshot, found.size, found.created, {**found.metadata, "sharedwith": " ".join(shares)})
 
     def _snapshot_id(self, snapshot: str) -> str:
@@ -482,7 +482,7 @@ class Console:
         if copy is None:
             raise ConsoleError(404, "no_copy", f"{database} has no copy.")
         await self._kube_for(env).delete(f"{path}/{copy['metadata']['name']}")
-        await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action="copy.dropped", database=database, namespace=namespace, target=copy["spec"].get("name", ""))
+        await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action="copy.dropped", at=self._now(), database=database, namespace=namespace, target=copy["spec"].get("name", ""))
 
     async def download(self, actor: Actor, name: str, database: str, snapshot: str) -> tuple[Container, str, str]:
         """The container and blob to stream, and a file name, once the download is recorded."""
@@ -494,7 +494,7 @@ class Console:
         blob = snapshot_blob(database, self._snapshot_id(snapshot))
         if await self._storage[env.name].properties(blob) is None:
             raise ConsoleError(404, "unknown_snapshot", f"{env.name} has no snapshot {snapshot} of {database}.")
-        await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action="snapshot.downloaded", database=database, namespace=namespace, snapshot=blob)
+        await audit.record(self._storage[env.name], environment=env.name, actor=actor.upn, action="snapshot.downloaded", at=self._now(), database=database, namespace=namespace, snapshot=blob)
         return self._storage[env.name], blob, f"{env.name}-{database}-{snapshot}.dump"
 
     # ── Scripts ─────────────────────────────────────────────────────────────────────
@@ -657,7 +657,7 @@ class Console:
         labels = meta.get("labels") or {}
         await self._kube_for(env).delete(f"/apis/batch/v1/namespaces/{env.namespace}/jobs/{meta['name']}")
         await audit.record(
-            self._storage[env.name], environment=env.name, actor=actor, action=action, database=labels.get(f"{jobs.PREFIX}database", ""),
+            self._storage[env.name], environment=env.name, actor=actor, action=action, at=self._now(), database=labels.get(f"{jobs.PREFIX}database", ""),
             namespace=self._namespace_of_job(env, job), job=meta["name"], detail=detail,
         )  # fmt: skip
 
